@@ -1,0 +1,17 @@
+{
+  "name": "crazy-arcade",
+  "version": "1.0.0",
+  "description": "Web-based multiplayer Crazy Arcade style game",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node test/smoke.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.7.5"
+  }
+}

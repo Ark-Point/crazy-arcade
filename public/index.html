@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>크레이지 아케이드</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 닉네임 입력 -->
+  <div id="screen-login" class="screen active">
+    <div class="panel">
+      <h1>💧 크레이지 아케이드</h1>
+      <p class="subtitle">물풍선으로 상대를 가둬라!</p>
+      <input id="nick-input" type="text" maxlength="12" placeholder="닉네임 입력" autocomplete="off" />
+      <button id="btn-enter" class="btn-primary">입장하기</button>
+    </div>
+  </div>
+
+  <!-- 로비 (방 목록) -->
+  <div id="screen-lobby" class="screen">
+    <div class="panel wide">
+      <h2>🏠 로비</h2>
+      <div class="lobby-actions">
+        <input id="room-name-input" type="text" maxlength="20" placeholder="방 이름 (선택)" autocomplete="off" />
+        <button id="btn-create" class="btn-primary">방 만들기</button>
+      </div>
+      <div id="room-list" class="room-list"></div>
+    </div>
+  </div>
+
+  <!-- 대기실 -->
+  <div id="screen-room" class="screen">
+    <div class="panel wide">
+      <h2 id="room-title">대기실</h2>
+      <div id="mode-row" class="mode-row">
+        <button id="btn-mode-ffa" class="btn-mode">⚔️ 개인전</button>
+        <button id="btn-mode-team" class="btn-mode">🤝 팀전</button>
+        <button id="btn-mode-boss" class="btn-mode">👾 보스전</button>
+      </div>
+      <div id="team-row" class="team-row hidden">
+        <span>내 팀:</span>
+        <button id="btn-team-red" class="btn-team red">🔴 레드</button>
+        <button id="btn-team-blue" class="btn-team blue">🔵 블루</button>
+      </div>
+      <div class="char-pick">
+        <div class="char-pick-label">캐릭터 선택</div>
+        <div id="char-list" class="char-list"></div>
+      </div>
+      <div id="player-list" class="player-list"></div>
+      <div class="room-actions">
+        <button id="btn-start" class="btn-primary">게임 시작</button>
+        <button id="btn-leave" class="btn-secondary">나가기</button>
+      </div>
+      <p class="hint">호스트가 시작하면 게임이 시작됩니다 · 이동: 방향키/WASD · 물풍선: 스페이스</p>
+    </div>
+  </div>
+
+  <!-- 게임 -->
+  <div id="screen-game" class="screen">
+    <div class="game-row">
+      <div class="game-wrap">
+        <div class="canvas-wrap">
+          <canvas id="game-canvas" width="600" height="520"></canvas>
+          <div id="overlay" class="overlay hidden"></div>
+        </div>
+        <div class="bottom-bar">
+          <span class="bb-label">내 아이템</span>
+          <div class="bb-slots" id="bb-slots"></div>
+          <span class="bb-hint">이동 방향키 · 풍선 Space · 바늘 Ctrl/X</span>
+        </div>
+      </div>
+      <aside class="sidebar">
+        <div class="timer-box">
+          <span class="timer-label">TIMER</span>
+          <span id="timer" class="timer-digits">02:00</span>
+        </div>
+        <div id="player-cards" class="player-cards"></div>
+        <div class="item-box">
+          <div class="item-box-label">ITEM</div>
+          <div id="item-slot" class="item-slot"></div>
+        </div>
+        <button id="btn-help" class="btn-side">게임 방법</button>
+        <button id="btn-exit" class="btn-side danger">나가기</button>
+      </aside>
+      <aside class="guide hidden" id="guide">
+        <button id="btn-guide-close" class="guide-close">✕</button>
+        <h3>🎮 조작법</h3>
+        <ul>
+          <li><b>방향키 / WASD</b> — 이동</li>
+          <li><b>스페이스</b> — 물풍선 설치</li>
+          <li><b>Ctrl / X</b> — 바늘로 탈출 (갇혔을 때)</li>
+        </ul>
+        <h3>💣 물풍선</h3>
+        <ul>
+          <li>설치 후 <b>3초</b> 뒤 십자 방향으로 폭발</li>
+          <li>물줄기가 다른 물풍선에 닿으면 <b>연쇄 폭발</b></li>
+          <li>박스는 부서지고, 돌은 물줄기를 막음</li>
+          <li>방금 놓은 풍선은 벗어나기 전까지 통과 가능</li>
+        </ul>
+        <h3>💧 갇히면?</h3>
+        <ul>
+          <li>물줄기에 맞으면 <b>물방울에 갇힘</b> (6초)</li>
+          <li>시간이 다 되거나 <b>적이 터치하면 탈락</b></li>
+          <li>🪡 바늘이 있으면 <b>Ctrl / X</b>로 즉시 탈출</li>
+          <li class="team-only">팀전: <b>아군이 터치하면 구출!</b></li>
+        </ul>
+        <h3>🎁 아이템 (박스에서 드롭)</h3>
+        <ul id="guide-items">
+          <li>🎈 <b>물풍선</b> — 동시에 놓을 수 있는 개수 +1</li>
+          <li>💧 <b>물약</b> — 물줄기 길이 +1</li>
+          <li>🛼 <b>롤러</b> — 이동 속도 증가</li>
+          <li>🪡 <b>바늘</b> — 갇혔을 때 탈출용 (최대 3개)</li>
+          <li>👟 <b>신발</b> — 물풍선에 다가가 밀면 <b>슝~ 날아감</b></li>
+          <li>🌊 <b>울트라</b> — 물줄기 길이 최대치!</li>
+        </ul>
+        <h3>🏆 승리 조건</h3>
+        <ul>
+          <li>개인전: <b>최후의 1인</b></li>
+          <li>팀전: <b>상대 팀 전멸</b></li>
+          <li>보스전: <b>보스 처치</b> (전원 탈락/시간 초과 시 패배)</li>
+        </ul>
+        <h3>👾 보스전 (협동)</h3>
+        <ul>
+          <li>모두 한 팀! <b>물줄기로 보스를 공격</b></li>
+          <li><b>빨간 예고 장판</b>은 물대포 착탄 지점 — 피하세요</li>
+          <li>물대포 직후 보스가 <b>그로기</b> 상태 → <b>데미지 2배</b></li>
+          <li>보스/쫄몹에 닿으면 갇힘 — <b>동료가 구출</b> 가능</li>
+          <li>체력이 줄면 보스가 <b>분노/폭주</b>하며 강해집니다</li>
+        </ul>
+      </aside>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="shared.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>
