@@ -1,4 +1,3 @@
-/* global io, Shared */
 const { COLS, ROWS, TILE, TICK_MS, HALF, BASE_SPEED, SPEED_STEP } = Shared;
 const STREAM_TICKS = 18;
 const TRAP_TICKS = 180;
@@ -6,17 +5,11 @@ const INTERP_DELAY = 100; // render remote players this far in the past (ms)
 
 const PLAYER_COLORS = ['#ff5252', '#448aff', '#66bb6a', '#ffb300', '#ab47bc', '#26c6da', '#ec407a', '#8d6e63'];
 const TEAM_COLORS = { red: '#ff5252', blue: '#448aff' };
-
-// original code-drawn roster (no external sprite assets)
-const CHARACTERS = [
-  { name: '버니', color: '#f3f3f3' },
-  { name: '냥이', color: '#ffb74d' },
-  { name: '개구리', color: '#81c784' },
-  { name: '곰돌이', color: '#bf9270' },
-  { name: '펭구', color: '#607d8b' },
-  { name: '로보', color: '#b0bec5' },
-];
-const ITEM_EMOJI = { bomb: '🎈', power: '💧', speed: '🛼', needle: '🪡', shoes: '👟', ultra: '🌊' };
+const CHARACTERS = Catalog.CHARACTERS;
+const ITEM_DEFS = Catalog.ITEM_DEFS;
+const ACTIVE_ITEMS = Catalog.ACTIVE_ITEMS;
+const ASSET_ROOT = '/assets/game-icons/';
+const ICON_CACHE = new Map();
 
 const socket = io();
 
@@ -41,6 +34,22 @@ function toast(msg) {
   el._timer = setTimeout(() => el.classList.add('hidden'), 2500);
 }
 
+function assetUrl(file) {
+  return `${ASSET_ROOT}${file}`;
+}
+
+function iconImage(file) {
+  if (!file) return null;
+  let img = ICON_CACHE.get(file);
+  if (!img) {
+    img = new Image();
+    img.decoding = 'async';
+    img.src = assetUrl(file);
+    ICON_CACHE.set(file, img);
+  }
+  return img;
+}
+
 // ---------- 로그인 ----------
 $('#btn-enter').addEventListener('click', enter);
 $('#nick-input').addEventListener('keydown', (e) => {
@@ -50,6 +59,7 @@ $('#nick-input').addEventListener('keydown', (e) => {
 function enter() {
   const nick = $('#nick-input').value.trim();
   if (!nick) return toast('닉네임을 입력하세요.');
+  AudioFx.unlock();
   socket.emit('setNick', nick);
   showScreen('lobby');
 }
@@ -69,7 +79,10 @@ socket.on('rooms', (rooms) => {
   for (const r of rooms) {
     const div = document.createElement('div');
     div.className = 'room-item' + (r.playing ? ' playing' : '');
-    div.innerHTML = `<span class="room-name"></span><span class="room-meta">${r.count}/${r.max} · ${r.playing ? '게임 중' : '대기 중'}</span>`;
+    const mapName = Catalog.getMap(r.mapId).name;
+    const modeName = r.mode === 'boss' ? '보스' : r.mode === 'team' ? '팀전' : '개인';
+    const spectatorText = r.spectators ? ` · 관전 ${r.spectators}` : '';
+    div.innerHTML = `<span class="room-name"></span><span class="room-meta">${modeName} · ${mapName} · 플레이 ${r.count}/${r.max}${spectatorText} · ${r.playing ? '게임 중' : '대기 중'}</span>`;
     div.querySelector('.room-name').textContent = r.name;
     if (!r.playing && r.count < r.max) {
       div.addEventListener('click', () => socket.emit('joinRoom', r.id));
@@ -88,15 +101,459 @@ socket.on('joinedRoom', (room) => {
 
 socket.on('roomUpdate', (room) => {
   renderRoom(room);
+  if (room.state === 'waiting') {
+    agentPolicy.runtime = null;
+    renderAgentPolicy();
+  }
   if (room.state === 'waiting' && screens.game.classList.contains('active')) {
     showScreen('room');
   }
 });
 
+let currentRoomId = null;
+let currentRoom = null;
+const agentInvite = {
+  token: '',
+  pending: false,
+  status: '토큰 없음',
+};
+const agentPolicy = {
+  cards: [],
+  overview: '',
+  actionBudgetNote: '',
+  loaded: false,
+  error: '',
+  runtime: null,
+};
+
+function isAgentPlayer(player) {
+  return player && player.controller === 'agent';
+}
+
+function roomPlayers(room) {
+  return room && Array.isArray(room.players) ? room.players : [];
+}
+
+function roomSpectators(room) {
+  return room && Array.isArray(room.spectators) ? room.spectators : [];
+}
+
+function myRoomRole(room) {
+  const players = roomPlayers(room);
+  const spectators = roomSpectators(room);
+  const player = players.find((p) => p.id === socket.id) || null;
+  const spectator = spectators.find((p) => p.id === socket.id) || null;
+  return { player, spectator, isSpectator: !!spectator && !player };
+}
+
+function policyKindLabel(kind) {
+  if (kind === 'enforce') return '집행';
+  if (kind === 'create') return '생성';
+  return '정책';
+}
+
+function setInlineList(parent, label, items) {
+  const wrap = document.createElement('span');
+  wrap.className = 'agent-policy-inline';
+  const strong = document.createElement('b');
+  strong.textContent = label;
+  wrap.appendChild(strong);
+  wrap.appendChild(document.createTextNode((items || []).join(', ') || '없음'));
+  parent.appendChild(wrap);
+}
+
+function runtimePolicyBudget(runtime) {
+  const parts = [`runtime revision ${runtime.revision || 0}`];
+  if (runtime.schema === 'crazay-arkade-agent-runtime-policy.v2') parts.push('policy v2');
+  if (runtime.decisionSource === 'llm-reply') parts.push('LLM reply');
+  if (runtime.selectedHeuristicId) parts.push(`휴리스틱 ${runtime.selectedHeuristicId}`);
+  if (runtime.llmReplyId) parts.push(`reply ${runtime.llmReplyId}`);
+  if (runtime.decisionTick !== null && runtime.decisionTick !== undefined) parts.push(`판단 틱 ${runtime.decisionTick}`);
+  if (runtime.generatedAtTick !== null && runtime.generatedAtTick !== undefined) parts.push(`관측 틱 ${runtime.generatedAtTick}`);
+  return parts.join(' · ');
+}
+
+function renderPolicyChips(parent, runtime) {
+  const chipRow = document.createElement('div');
+  chipRow.className = 'agent-policy-chips';
+  const entries = [
+    ['phase', runtime.phase],
+    ['intent', runtime.intent],
+    ['fallback', runtime.fallbackHeuristicId],
+    ['risk', runtime.risk],
+    ['confidence', runtime.confidence !== null && runtime.confidence !== undefined ? Math.round(runtime.confidence * 100) + '%' : null],
+    ['horizon', runtime.expectedHorizonTicks ? `${runtime.expectedHorizonTicks}t` : null],
+  ];
+  for (const [label, value] of entries) {
+    if (value === null || value === undefined || value === '') continue;
+    const chip = document.createElement('span');
+    chip.className = 'agent-policy-chip';
+    chip.textContent = `${label}:${value}`;
+    chipRow.appendChild(chip);
+  }
+  if (Array.isArray(runtime.constraints)) {
+    for (const value of runtime.constraints.slice(0, 4)) {
+      const chip = document.createElement('span');
+      chip.className = 'agent-policy-chip';
+      chip.textContent = `constraint:${value}`;
+      chipRow.appendChild(chip);
+    }
+  }
+  if (chipRow.childElementCount) parent.appendChild(chipRow);
+}
+
+function renderSequencePlan(parent, plan) {
+  if (!plan || typeof plan !== 'object') return;
+  const row = document.createElement('div');
+  row.className = 'agent-policy-mask agent-policy-sequence';
+  const entries = [
+    ['seq', plan.kind],
+    ['objective', plan.objective],
+    ['remain', plan.remainingMoves !== null && plan.remainingMoves !== undefined ? `${plan.remainingMoves}m` : null],
+    ['horizon', plan.horizonTicks !== null && plan.horizonTicks !== undefined ? `${plan.horizonTicks}t` : null],
+    ['score', plan.score !== null && plan.score !== undefined ? String(plan.score) : null],
+  ];
+  if (plan.scoreBreakdown && typeof plan.scoreBreakdown === 'object') {
+    for (const key of ['survival', 'trap', 'farm', 'position']) {
+      if (plan.scoreBreakdown[key] !== null && plan.scoreBreakdown[key] !== undefined) entries.push([key, plan.scoreBreakdown[key]]);
+    }
+  }
+  if (plan.target && typeof plan.target === 'object') {
+    entries.push(['target', plan.target.type || plan.target.playerId || `${plan.target.x},${plan.target.y}`]);
+  }
+  if (Array.isArray(plan.interrupts) && plan.interrupts.length) {
+    entries.push(['interrupts', plan.interrupts.slice(0, 3).join('|')]);
+  }
+  for (const [label, value] of entries) {
+    if (value === null || value === undefined || value === '') continue;
+    const chip = document.createElement('span');
+    chip.className = `agent-policy-sequence-item seq-${label}`;
+    const key = document.createElement('span');
+    key.className = 'agent-policy-sequence-key';
+    key.textContent = label;
+    const val = document.createElement('span');
+    val.className = 'agent-policy-sequence-value';
+    val.textContent = value;
+    chip.append(key, val);
+    row.appendChild(chip);
+  }
+  if (row.childElementCount) parent.appendChild(row);
+}
+
+function renderActionMask(parent, mask) {
+  if (!mask || typeof mask !== 'object') return;
+  const row = document.createElement('div');
+  row.className = 'agent-policy-mask';
+  for (const [key, value] of Object.entries(mask)) {
+    const chip = document.createElement('span');
+    chip.className = 'agent-policy-chip';
+    chip.textContent = Array.isArray(value) ? `${key}:${value.join('|') || 'none'}` : `${key}:${String(value)}`;
+    row.appendChild(chip);
+  }
+  if (row.childElementCount) parent.appendChild(row);
+}
+
+function renderBenchmark(parent, benchmark) {
+  if (!benchmark || typeof benchmark !== 'object') return;
+  const row = document.createElement('div');
+  row.className = 'agent-policy-benchmark';
+  for (const [key, value] of Object.entries(benchmark).slice(0, 8)) {
+    const chip = document.createElement('span');
+    chip.className = 'agent-policy-chip';
+    chip.textContent = `${key}:${value}`;
+    row.appendChild(chip);
+  }
+  if (row.childElementCount) parent.appendChild(row);
+}
+
+function renderAgentPolicy() {
+  const panel = $('#agent-policy-panel');
+  if (!panel) return;
+  const summary = $('#agent-policy-summary');
+  const list = $('#agent-policy-list');
+  const budget = $('#agent-policy-budget');
+  const externalRuntime = window.agentPolicy && window.agentPolicy.schema ? window.agentPolicy : null;
+  const runtime = externalRuntime || agentPolicy.runtime;
+  if (runtime) panel.open = true;
+  const cards = runtime && Array.isArray(runtime.cards) && runtime.cards.length ? runtime.cards : agentPolicy.cards;
+  summary.textContent = agentPolicy.error
+    || (runtime ? `${runtime.nick || 'AI'}가 게임 중 생성` : agentPolicy.overview)
+    || '기준 정책 불러오는 중';
+  budget.textContent = runtime ? runtimePolicyBudget(runtime) : (agentPolicy.actionBudgetNote || '액션 예산 확인 중');
+  list.replaceChildren();
+
+  if (agentPolicy.error) {
+    const empty = document.createElement('div');
+    empty.className = 'agent-policy-empty';
+    empty.textContent = '정책 정보를 불러오지 못했습니다.';
+    list.appendChild(empty);
+    return;
+  }
+
+  if (runtime) {
+    const item = document.createElement('article');
+    item.className = 'agent-policy-card agent-policy-context enforce';
+    const head = document.createElement('div');
+    head.className = 'agent-policy-card-head';
+    const badge = document.createElement('span');
+    badge.className = 'agent-policy-kind';
+    badge.textContent = '선택';
+    const title = document.createElement('b');
+    title.textContent = runtime.selectedHeuristicId || 'runtime-policy';
+    head.append(badge, title);
+    const summaryText = document.createElement('p');
+    summaryText.textContent = runtime.reason || runtime.overview || 'LLM reply tick에서 현재 집행할 휴리스틱을 선택했습니다.';
+    item.append(head);
+    renderSequencePlan(item, runtime.sequencePlan);
+    item.append(summaryText);
+    renderPolicyChips(item, runtime);
+    renderActionMask(item, runtime.actionMask);
+    renderBenchmark(item, runtime.benchmark);
+    list.appendChild(item);
+  }
+
+  for (const card of cards) {
+    const item = document.createElement('article');
+    item.className = `agent-policy-card ${card.kind === 'enforce' ? 'enforce' : 'create'}`;
+    const head = document.createElement('div');
+    head.className = 'agent-policy-card-head';
+    const badge = document.createElement('span');
+    badge.className = 'agent-policy-kind';
+    badge.textContent = policyKindLabel(card.kind);
+    const title = document.createElement('b');
+    title.textContent = `${card.priority}. ${card.title}`;
+    head.append(badge, title);
+
+    const summaryText = document.createElement('p');
+    summaryText.textContent = card.summary;
+    const meta = document.createElement('div');
+    meta.className = 'agent-policy-meta';
+    setInlineList(meta, '신호 ', card.signals);
+    setInlineList(meta, '행동 ', card.actions);
+    item.append(head, summaryText, meta);
+    list.appendChild(item);
+  }
+}
+
+window.agentPolicy = agentPolicy;
+window.renderAgentPolicy = renderAgentPolicy;
+
+socket.on('agentPolicyUpdate', (policy) => {
+  if (!policy || !Array.isArray(policy.cards) || !policy.cards.length) return;
+  if (policy.roomId && currentRoomId && policy.roomId !== currentRoomId) return;
+  agentPolicy.runtime = policy;
+  renderAgentPolicy();
+});
+
+async function loadAgentPolicy() {
+  if (agentPolicy.loaded) return;
+  try {
+    const res = await fetch('/agent/heuristic-policy', { credentials: 'same-origin' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    agentPolicy.cards = Array.isArray(data.cards) ? data.cards : [];
+    agentPolicy.overview = data.overview || '';
+    agentPolicy.actionBudgetNote = data.actionBudgetNote || '';
+    agentPolicy.loaded = true;
+  } catch {
+    agentPolicy.error = '휴리스틱 정책을 불러올 수 없습니다.';
+  }
+  renderAgentPolicy();
+}
+loadAgentPolicy();
+
+function extractInviteToken(source) {
+  if (!source || typeof source !== 'object') return '';
+  return (
+    source.token ||
+    source.inviteToken ||
+    source.agentInviteToken ||
+    (source.agentInvite && source.agentInvite.token) ||
+    (source.invite && source.invite.token) ||
+    ''
+  );
+}
+
+function normalizeInviteAck(err, payload) {
+  const errMessage = err && typeof err.message === 'string' ? err.message : '';
+  if (err && !payload && !errMessage) {
+    payload = err;
+    err = null;
+  }
+  if (err) return { ok: false, message: '서버 응답이 없습니다.' };
+  if (typeof payload === 'string') return { ok: true, token: payload };
+  if (!payload || typeof payload !== 'object') return { ok: true };
+  return {
+    ok: payload.ok !== false && !payload.error,
+    token: extractInviteToken(payload),
+    message: payload.message || payload.error || '',
+  };
+}
+
+function redactToken(token) {
+  if (!token) return '토큰 없음';
+  if (token.length <= 8) return `${token.slice(0, 2)}••••`;
+  return `${token.slice(0, 4)}••••${token.slice(-4)}`;
+}
+
+function agentInviteCommand(token) {
+  const value = token || '<초대-토큰>';
+  return `CRAZAY_ARKADE_AGENT_TOKEN=${value} node examples/llm-reply-agent.js --url ${window.location.origin}`;
+}
+
+function setAgentInviteStatus(status, token) {
+  if (typeof token === 'string') agentInvite.token = token;
+  agentInvite.status = status || (agentInvite.token ? 'AI 초대 토큰 준비됨' : '토큰 없음');
+  renderAgentInvite();
+}
+
+function renderAgentInvite() {
+  const panel = $('#agent-invite-panel');
+  if (!panel) return;
+  const role = myRoomRole(currentRoom);
+  const me = role.player || role.spectator;
+  const ownedAgent = currentRoom && roomPlayers(currentRoom).find((p) => isAgentPlayer(p) && p.ownerId === socket.id);
+  const canManage = !!me && !isAgentPlayer(me) && currentRoom.state === 'waiting';
+  const hasToken = !!agentInvite.token;
+  const hasOwnedAgent = !!ownedAgent;
+  const tokenEl = $('#agent-invite-token');
+  const statusEl = $('#agent-invite-status');
+  const createBtn = $('#btn-agent-invite-create');
+  const commandCopyBtn = $('#btn-agent-command-copy');
+  const revokeBtn = $('#btn-agent-invite-revoke');
+  const commandPreview = $('#agent-command-preview');
+
+  tokenEl.textContent = redactToken(agentInvite.token);
+  tokenEl.classList.toggle('empty', !hasToken);
+  commandPreview.textContent = hasToken
+    ? agentInviteCommand(redactToken(agentInvite.token))
+    : '초대 토큰을 만들면 실행 명령이 표시됩니다.';
+  commandPreview.classList.toggle('empty', !hasToken);
+  statusEl.textContent = canManage
+    ? (hasOwnedAgent && !hasToken ? 'AI 참가 중' : agentInvite.status)
+    : '대기실 구성원만 AI 초대를 만들 수 있습니다.';
+  createBtn.disabled = !canManage || hasOwnedAgent || agentInvite.pending;
+  commandCopyBtn.disabled = !canManage || !hasToken || agentInvite.pending;
+  revokeBtn.disabled = !canManage || (!hasToken && !hasOwnedAgent) || agentInvite.pending;
+  createBtn.textContent = agentInvite.pending ? '처리 중' : hasOwnedAgent ? '참가 중' : hasToken ? '다시 만들기' : '초대 만들기';
+}
+
+function resetAgentInvite() {
+  agentInvite.token = '';
+  agentInvite.pending = false;
+  agentInvite.status = '토큰 없음';
+  renderAgentInvite();
+}
+
+function emitInviteEvent(eventName, busyText, onSuccess) {
+  if (!currentRoom) return;
+  agentInvite.pending = true;
+  agentInvite.status = busyText;
+  renderAgentInvite();
+  const target = typeof socket.timeout === 'function' ? socket.timeout(5000) : socket;
+  target.emit(eventName, {}, (err, payload) => {
+    agentInvite.pending = false;
+    const ack = normalizeInviteAck(err, payload);
+    if (!ack.ok) {
+      setAgentInviteStatus(ack.message || 'AI 초대 요청에 실패했습니다.');
+      return;
+    }
+    onSuccess(ack);
+  });
+}
+
+function createAgentInvite() {
+  emitInviteEvent('createAgentInvite', 'AI 초대 토큰 생성 중...', (ack) => {
+    if (!ack.token) {
+      setAgentInviteStatus('초대는 요청됐지만 토큰이 없습니다.');
+      return;
+    }
+    setAgentInviteStatus('AI 초대 토큰 준비됨', ack.token);
+  });
+}
+
+function revokeAgentInvite() {
+  emitInviteEvent('revokeAgentInvite', 'AI 초대 취소 중...', () => {
+    setAgentInviteStatus('AI 초대를 취소했습니다.', '');
+  });
+}
+
+async function copyTextToClipboard(textValue, successMessage) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(textValue);
+    } else {
+      const text = document.createElement('textarea');
+      text.value = textValue;
+      text.setAttribute('readonly', '');
+      text.style.position = 'fixed';
+      text.style.opacity = '0';
+      document.body.appendChild(text);
+      text.select();
+      const copied = document.execCommand('copy');
+      text.remove();
+      if (!copied) throw new Error('copy command rejected');
+    }
+    setAgentInviteStatus(successMessage);
+  } catch {
+    setAgentInviteStatus('복사할 수 없습니다. 브라우저 권한을 확인하세요.');
+  }
+}
+
+async function copyAgentInviteCommand() {
+  if (!agentInvite.token) return;
+  await copyTextToClipboard(agentInviteCommand(agentInvite.token), '실행 명령을 복사했습니다.');
+}
+
+function appendAgentBadge(parent, isAgent) {
+  let badge = parent.querySelector(':scope > .agent-badge');
+  if (isAgent && !badge) {
+    badge = document.createElement('span');
+    badge.className = 'agent-badge';
+    badge.textContent = 'AI';
+    parent.appendChild(badge);
+  } else if (!isAgent && badge) {
+    badge.remove();
+  }
+}
+
+socket.on('agentInvite', (invite) => {
+  const token = extractInviteToken(invite);
+  setAgentInviteStatus(token ? 'AI 초대 토큰 준비됨' : 'AI 초대 정보가 갱신되었습니다.', token || agentInvite.token);
+});
+
+socket.on('agentInviteRevoked', () => {
+  setAgentInviteStatus('AI 초대를 취소했습니다.', '');
+});
+
+socket.on('agentInviteError', (payload) => {
+  const message = payload && (payload.message || payload.error);
+  setAgentInviteStatus(message || 'AI 초대 요청에 실패했습니다.');
+});
+
 function renderRoom(room) {
-  $('#room-title').textContent = `🏠 ${room.name}`;
+  if (currentRoomId !== room.id) {
+    currentRoomId = room.id;
+    agentPolicy.runtime = null;
+    renderAgentPolicy();
+    resetAgentInvite();
+  }
+  currentRoom = room;
+  const roomToken = extractInviteToken(room);
+  if (roomToken) agentInvite.token = roomToken;
+  if ('agentInvite' in room && !room.agentInvite) agentInvite.token = '';
+  if (roomPlayers(room).some((p) => isAgentPlayer(p) && p.ownerId === socket.id)) {
+    agentInvite.token = '';
+  }
+  $('#room-title').textContent = room.name;
+  const feedJoin = $('#room-feed-join');
+  if (feedJoin) feedJoin.textContent = `${room.name}에 참가하셨습니다.`;
   const isHost = room.host === socket.id;
   const teamMode = room.mode === 'team';
+  const role = myRoomRole(room);
+  const me = role.player;
+  const spectatorMe = role.spectator;
+  const isSpectator = role.isSpectator;
 
   $('#btn-mode-ffa').classList.toggle('selected', room.mode === 'ffa');
   $('#btn-mode-team').classList.toggle('selected', teamMode);
@@ -106,46 +563,145 @@ function renderRoom(room) {
   $('#btn-mode-boss').disabled = !isHost;
 
   $('#team-row').classList.toggle('hidden', !teamMode);
-  const me = room.players.find((p) => p.id === socket.id);
+  $('#map-list').classList.toggle('disabled', !isHost || room.mode === 'boss');
+  $('#map-list').classList.toggle('boss', room.mode === 'boss');
+  const selectedMapId = room.mode === 'boss' ? 'boss-cove' : room.mapId;
+  document.querySelectorAll('.map-btn').forEach((b) => {
+    b.classList.toggle('selected', b.dataset.map === selectedMapId);
+    b.disabled = !isHost || room.mode === 'boss' || b.dataset.map === 'boss-cove';
+  });
   $('#btn-team-red').classList.toggle('selected', !!me && me.team === 'red');
   $('#btn-team-blue').classList.toggle('selected', !!me && me.team === 'blue');
-  if (me && typeof me.char === 'number') {
-    myChar = me.char;
+  $('#btn-team-red').disabled = isSpectator;
+  $('#btn-team-blue').disabled = isSpectator;
+  const activeMember = me || spectatorMe;
+  if (activeMember && typeof activeMember.char === 'number') {
+    myChar = activeMember.char;
     document.querySelectorAll('.char-btn').forEach((b) => b.classList.toggle('selected', +b.dataset.char === myChar));
   }
 
   const list = $('#player-list');
   list.innerHTML = '';
   for (let i = 0; i < 8; i++) {
-    const p = room.players[i];
+    const p = roomPlayers(room)[i];
     const div = document.createElement('div');
     if (p) {
       div.className = 'player-slot';
-      const charName = CHARACTERS[p.char || 0].name;
+      const charId = p.char || 0;
+      const charName = CHARACTERS[charId].name;
+      const archetype = CHARACTERS[charId].archetype;
+      const avatarWrap = document.createElement('div');
+      avatarWrap.className = 'slot-avatar';
+      const cv = document.createElement('canvas');
+      cv.width = 72;
+      cv.height = 72;
+      const g = cv.getContext('2d');
+      g.translate(36, 43);
+      g.scale(1.8, 1.8);
+      drawAvatar(g, charId, CHARACTERS[charId].color, 0, 0.3);
+      avatarWrap.appendChild(cv);
+      const copy = document.createElement('span');
+      copy.className = 'player-slot-copy';
+      const meta = document.createElement('span');
+      meta.className = 'player-slot-meta';
       if (teamMode) {
         div.classList.add(p.team === 'blue' ? 'team-blue' : 'team-red');
-        div.textContent = `${p.team === 'blue' ? '🔵' : '🔴'} ${p.nick} (${charName})`;
+        copy.textContent = p.nick;
+        meta.textContent = `${p.team === 'blue' ? '블루' : '레드'} · ${charName} · ${archetype}`;
       } else {
         div.style.borderLeft = `5px solid ${PLAYER_COLORS[i]}`;
-        div.textContent = `${p.nick} (${charName})`;
+        copy.textContent = p.nick;
+        meta.textContent = `${charName} · ${archetype}`;
       }
+      div.appendChild(avatarWrap);
+      div.appendChild(copy);
+      div.appendChild(meta);
       if (p.id === room.host) {
         const b = document.createElement('span');
         b.className = 'badge';
         b.textContent = '방장';
         div.appendChild(b);
       }
+      appendAgentBadge(div, isAgentPlayer(p));
     } else {
       div.className = 'player-slot empty';
       div.textContent = '빈 자리';
     }
     list.appendChild(div);
   }
+  const spectatorList = $('#spectator-list');
+  spectatorList.replaceChildren();
+  const spectators = roomSpectators(room);
+  if (!spectators.length) {
+    const empty = document.createElement('span');
+    empty.className = 'spectator-empty';
+    empty.textContent = '관전자 없음';
+    spectatorList.appendChild(empty);
+  } else {
+    for (const s of spectators) {
+      const chip = document.createElement('span');
+      chip.className = 'spectator-chip';
+      const charName = CHARACTERS[s.char || 0].name;
+      chip.textContent = `${s.nick} (${charName})`;
+      if (s.id === room.host) {
+        const badge = document.createElement('b');
+        badge.className = 'badge';
+        badge.textContent = '방장';
+        chip.appendChild(badge);
+      }
+      spectatorList.appendChild(chip);
+    }
+  }
+  const spectatorBtn = $('#btn-spectator-toggle');
+  spectatorBtn.disabled = room.state !== 'waiting';
+  spectatorBtn.textContent = isSpectator ? '플레이어 슬롯으로 이동' : '관전 슬롯으로 이동';
   $('#btn-start').style.display = isHost ? '' : 'none';
+  $('#btn-start').textContent = isHost ? '준 비' : '준 비';
+  renderAgentInvite();
 }
 
-// character picker: preview thumbnails drawn with the in-game avatar code
+function statBar(label, value, max) {
+  const wrap = document.createElement('div');
+  wrap.className = 'stat-row';
+  const name = document.createElement('span');
+  name.textContent = label;
+  const bar = document.createElement('i');
+  bar.style.setProperty('--v', `${Math.max(12, Math.round((value / max) * 100))}%`);
+  wrap.appendChild(name);
+  wrap.appendChild(bar);
+  return wrap;
+}
+
+function buildMapPicker() {
+  const list = $('#map-list');
+  [...Catalog.MAP_ORDER, 'boss-cove'].forEach((id) => {
+    const map = Catalog.MAPS[id];
+    const btn = document.createElement('button');
+    btn.className = 'map-btn' + (id === 'village' ? ' selected' : '');
+    if (id === 'boss-cove') btn.classList.add('boss-only');
+    btn.dataset.map = id;
+    const icon = document.createElement('img');
+    icon.className = 'map-icon';
+    icon.alt = '';
+    icon.src = assetUrl(map.icon);
+    icon.decoding = 'async';
+    const copy = document.createElement('div');
+    copy.className = 'map-copy';
+    const title = document.createElement('strong');
+    title.textContent = map.name;
+    const desc = document.createElement('span');
+    desc.textContent = map.description;
+    copy.appendChild(title);
+    copy.appendChild(desc);
+    btn.appendChild(icon);
+    btn.appendChild(copy);
+    if (Catalog.MAP_ORDER.includes(id)) btn.addEventListener('click', () => socket.emit('setMap', id));
+    list.appendChild(btn);
+  });
+}
+
 let myChar = 0;
+buildMapPicker();
 (function buildCharPicker() {
   const list = $('#char-list');
   CHARACTERS.forEach((c, i) => {
@@ -162,8 +718,14 @@ let myChar = 0;
     const name = document.createElement('span');
     name.className = 'char-name';
     name.textContent = c.name;
+    const stats = document.createElement('div');
+    stats.className = 'char-stats';
+    stats.appendChild(statBar('물풍선', c.stats.maxBombs, 10));
+    stats.appendChild(statBar('물줄기', c.stats.maxPower, 9));
+    stats.appendChild(statBar('속도', c.stats.maxSpeedLevel + 4, 10));
     btn.appendChild(cv);
     btn.appendChild(name);
+    btn.appendChild(stats);
     btn.addEventListener('click', () => {
       myChar = i;
       socket.emit('setChar', i);
@@ -173,9 +735,16 @@ let myChar = 0;
   });
 })();
 
-$('#btn-start').addEventListener('click', () => socket.emit('startGame'));
+$('#btn-start').addEventListener('click', () => {
+  AudioFx.unlock();
+  socket.emit('startGame');
+});
 $('#btn-leave').addEventListener('click', () => {
   socket.emit('leaveRoom');
+  currentRoomId = null;
+  currentRoom = null;
+  agentPolicy.runtime = null;
+  resetAgentInvite();
   showScreen('lobby');
 });
 $('#btn-mode-ffa').addEventListener('click', () => socket.emit('setMode', 'ffa'));
@@ -183,6 +752,18 @@ $('#btn-mode-team').addEventListener('click', () => socket.emit('setMode', 'team
 $('#btn-mode-boss').addEventListener('click', () => socket.emit('setMode', 'boss'));
 $('#btn-team-red').addEventListener('click', () => socket.emit('setTeam', 'red'));
 $('#btn-team-blue').addEventListener('click', () => socket.emit('setTeam', 'blue'));
+$('#btn-spectator-toggle').addEventListener('click', () => {
+  if (!currentRoom) return;
+  const { isSpectator } = myRoomRole(currentRoom);
+  const target = typeof socket.timeout === 'function' ? socket.timeout(3000) : socket;
+  target.emit('setSpectator', { spectator: !isSpectator }, (err, ack) => {
+    if (err) return toast('관전자 상태를 변경하지 못했습니다.');
+    if (ack && ack.ok === false) toast(ack.error || '관전자 상태를 변경하지 못했습니다.');
+  });
+});
+$('#btn-agent-invite-create').addEventListener('click', createAgentInvite);
+$('#btn-agent-command-copy').addEventListener('click', copyAgentInviteCommand);
+$('#btn-agent-invite-revoke').addEventListener('click', revokeAgentInvite);
 
 // ---------- 게임: 넷코드 상태 ----------
 const canvas = $('#game-canvas');
@@ -210,12 +791,21 @@ const streamBorn = new Map(); // "x,y" -> time first seen
 const bgCanvas = document.createElement('canvas');
 bgCanvas.width = canvas.width;
 bgCanvas.height = canvas.height;
+const softCanvas = document.createElement('canvas');
+softCanvas.width = canvas.width;
+softCanvas.height = canvas.height;
+const softCtx = softCanvas.getContext('2d');
 let bgDrawn = false;
+let softLayerKey = '';
 
 const latest = () => (snapshots.length ? snapshots[snapshots.length - 1].s : null);
 const inGame = () => screens.game.classList.contains('active');
 
 socket.on('gameStart', ({ players }) => {
+  AudioFx.play('start');
+  resetAgentInvite();
+  agentPolicy.runtime = null;
+  renderAgentPolicy();
   buildPlayerCards(players || []);
   snapshots = [];
   offsetSamples = [];
@@ -234,12 +824,11 @@ socket.on('gameStart', ({ players }) => {
   playerAnim.clear();
   streamBorn.clear();
   bgDrawn = false;
+  softLayerKey = '';
   overlay.classList.add('hidden');
   showScreen('game');
 });
 
-// the predicted world mirrors server collision rules against the latest snapshot
-// returns 0 open / 1 solid / 2 exit-only (same contract as the server)
 const clientWorld = {
   solid(p, cx, cy) {
     const s = latest();
@@ -249,7 +838,7 @@ const clientWorld = {
     if (t === 1 || t === 2) return 1;
     const bomb = s.bombs.find((b) => b.x === cx && b.y === cy);
     if (bomb) {
-      // a balloon we are still standing on is exit-only; everything else is a wall
+      if (bomb.pass) return bomb.pass.includes(socket.id) ? 0 : 1;
       const ov =
         p.x + HALF > cx * TILE && p.x - HALF < (cx + 1) * TILE &&
         p.y + HALF > cy * TILE && p.y - HALF < (cy + 1) * TILE;
@@ -267,7 +856,10 @@ socket.on('state', (s) => {
   offsetSamples.push(performance.now() - serverMs);
   if (offsetSamples.length > 120) offsetSamples.shift();
 
-  if (prev && prev.countdown > 0 && s.countdown === 0) goFlashUntil = performance.now() + 700;
+  if (prev && prev.countdown > 0 && s.countdown === 0) {
+    goFlashUntil = performance.now() + 700;
+    AudioFx.play('go');
+  }
   if (prev) detectEffects(prev, s);
 
   const me = s.players.find((p) => p.id === socket.id);
@@ -275,7 +867,7 @@ socket.on('state', (s) => {
   const speed = BASE_SPEED + SPEED_STEP * me.speedLvl;
 
   if (!me.alive || me.trapped || s.countdown > 0) {
-    myPred = { x: me.x, y: me.y, speed };
+    myPred = { id: me.id, x: me.x, y: me.y, speed };
     pending = [];
     errX = errY = 0;
     return;
@@ -284,7 +876,7 @@ socket.on('state', (s) => {
   // server reconciliation: rewind to authoritative state, replay unacked inputs
   const visX = myPred ? myPred.x + errX : me.x;
   const visY = myPred ? myPred.y + errY : me.y;
-  myPred = { x: me.x, y: me.y, speed };
+  myPred = { id: me.id, x: me.x, y: me.y, speed };
   pending = pending.filter((c) => c.seq > me.seq);
   for (const c of pending) Shared.moveTick(clientWorld, myPred, c.keys);
   // keep rendering from the old position and decay the difference smoothly
@@ -295,6 +887,8 @@ socket.on('state', (s) => {
 
 socket.on('gameOver', ({ winner, winnerTeam, reason }) => {
   gameEnded = true;
+  agentPolicy.runtime = null;
+  renderAgentPolicy();
   const s = latest();
   const bossMode = !!(s && s.boss);
   const me = s && s.players.find((p) => p.id === socket.id);
@@ -321,6 +915,7 @@ socket.on('gameOver', ({ winner, winnerTeam, reason }) => {
   else title = '💀 무승부!';
 
   if (iWon) {
+    AudioFx.play('win');
     celebrateUntil = performance.now() + 5000;
     if (winner && winner.id === socket.id) detail = '최후의 1인이 되었습니다!';
     else if (winnerTeam) detail = '우리 팀이 해냈어요!';
@@ -334,6 +929,7 @@ socket.on('gameOver', ({ winner, winnerTeam, reason }) => {
       `<div class="sub">잠시 후 대기실로 돌아갑니다…</div>` +
       `</div>`;
   } else {
+    AudioFx.play('lose');
     const lose = reason === 'bossWipe' || winnerTeam || winner || (reason === 'timeout' && bossMode);
     overlay.innerHTML =
       `<div class="overlay-card ${lose ? 'lose' : ''}">` +
@@ -355,6 +951,11 @@ function escapeHtml(t) {
 function detectEffects(prev, s) {
   const me = s.players.find((p) => p.id === socket.id);
 
+  const prevBombs = new Set(prev.bombs.map((b) => b.id));
+  for (const b of s.bombs) {
+    if (!prevBombs.has(b.id)) AudioFx.play('place');
+  }
+
   // broken boxes -> debris
   for (let y = 0; y < ROWS; y++) {
     for (let x = 0; x < COLS; x++) {
@@ -371,6 +972,7 @@ function detectEffects(prev, s) {
     if (!prevKeys.has(key)) {
       streamBorn.set(key, performance.now());
       spawnDroplets(w.x * TILE + TILE / 2, w.y * TILE + TILE / 2, 3);
+      AudioFx.play('stream');
       if (me) {
         const d = Math.hypot(w.x * TILE + TILE / 2 - me.x, w.y * TILE + TILE / 2 - me.y);
         if (d < TILE * 3.5) shake = Math.min(9, shake + 4);
@@ -386,8 +988,15 @@ function detectEffects(prev, s) {
   for (const p of s.players) {
     const old = prevById.get(p.id);
     if (!old) continue;
-    if (old.alive && !p.alive) spawnSplash(old.x, old.y);
-    if (old.alive && p.alive && old.trapped && !p.trapped) spawnSparkle(p.x, p.y, '#b3e5fc');
+    if (old.alive && !p.alive) {
+      spawnSplash(old.x, old.y);
+      AudioFx.play('trap');
+    }
+    if (old.alive && p.alive && !old.trapped && p.trapped) AudioFx.play('trap');
+    if (old.alive && p.alive && old.trapped && !p.trapped) {
+      spawnSparkle(p.x, p.y, '#b3e5fc');
+      AudioFx.play('rescue');
+    }
   }
 
   // picked-up items -> sparkle
@@ -395,7 +1004,10 @@ function detectEffects(prev, s) {
   for (const it of prev.items) {
     if (!itemKeys.has(`${it.x},${it.y}`)) {
       const cellGotStreamed = s.streams.some((w) => w.x === it.x && w.y === it.y);
-      if (!cellGotStreamed) spawnSparkle(it.x * TILE + TILE / 2, it.y * TILE + TILE / 2, '#fff59d');
+      if (!cellGotStreamed) {
+        spawnSparkle(it.x * TILE + TILE / 2, it.y * TILE + TILE / 2, '#fff59d');
+        AudioFx.play('pickup');
+      }
     }
   }
 
@@ -404,11 +1016,14 @@ function detectEffects(prev, s) {
     if (s.boss.hp < prev.boss.hp) {
       spawnDamageText(s.boss.x, s.boss.y - 50, `-${prev.boss.hp - s.boss.hp}`);
       spawnDroplets(s.boss.x, s.boss.y - 20, 6);
+      AudioFx.play('boss');
     }
     if (s.boss.phase === 2 && prev.boss.phase === 1) {
       banner = { text: '👾 보스가 분노했다! 쫄몹 소환!', until: performance.now() + 2200 };
+      AudioFx.play('boss');
     } else if (s.boss.phase === 3 && prev.boss.phase === 2) {
       banner = { text: '🔥 보스 폭주!! 조심해!', until: performance.now() + 2200 };
+      AudioFx.play('boss');
     }
   }
   const prevMinions = new Set((prev.minions || []).map((m) => m.id));
@@ -649,6 +1264,15 @@ const KEYMAP = {
 
 document.addEventListener('keydown', (e) => {
   if (!inGame()) return;
+  if (e.code.startsWith('Digit')) {
+    const n = Number(e.code.slice(5));
+    const type = ACTIVE_ITEMS[n - 1];
+    if (type) {
+      socket.emit('selectItem', type);
+      e.preventDefault();
+    }
+    return;
+  }
   if (e.code === 'Space') {
     e.preventDefault();
     if (!e.repeat) {
@@ -661,7 +1285,10 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Control' || e.code === 'KeyX') {
     const s = latest();
     const me = s && s.players.find((p) => p.id === socket.id);
-    if (me && me.alive && me.trapped && !e.repeat) socket.emit('useNeedle');
+    if (me && me.alive && !e.repeat) {
+      socket.emit('useItem', me.selectedItem);
+      if (me.selectedItem === 'shield') AudioFx.play('shield');
+    }
     e.preventDefault();
     return;
   }
@@ -760,14 +1387,9 @@ function render(now) {
   if (shake > 0.3) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
 
   ctx.drawImage(bgCanvas, 0, 0);
+  drawSoftBlocksLayer(s);
 
-  // soft blocks (latest authoritative grid)
-  for (let y = 0; y < ROWS; y++) {
-    for (let x = 0; x < COLS; x++) {
-      if (s.grid[y][x] === 1) drawSoftBlock(x, y);
-    }
-  }
-
+  drawHazards(s, now);
   drawTelegraphs(s, now);
   drawItems(s, now);
   drawStreams(s, now);
@@ -782,6 +1404,59 @@ function render(now) {
 
   ctx.restore();
   renderUI(s, now);
+}
+
+function drawHazards(s, now) {
+  if (!s.hazards) return;
+  for (const h of s.hazards) {
+    const x = h.x * TILE + TILE / 2;
+    const y = h.y * TILE + TILE / 2;
+    if (h.type === 'bubbleTrap') {
+      const pulse = 0.5 + Math.sin(now / 180 + h.x) * 0.2;
+      ctx.fillStyle = `rgba(171,71,188,${0.22 + pulse * 0.16})`;
+      rr(ctx, h.x * TILE + 7, h.y * TILE + 7, TILE - 14, TILE - 14, 9);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.72)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, 8 + pulse * 3, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = '#f3e5f5';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('덫', x, y + 1);
+    } else if (h.type === 'current') {
+      ctx.fillStyle = 'rgba(38,198,218,0.24)';
+      rr(ctx, h.x * TILE + 3, h.y * TILE + 9, TILE - 6, TILE - 18, 12);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(225,245,254,0.75)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x - h.dx * 9, y - h.dy * 9);
+      ctx.lineTo(x + h.dx * 10, y + h.dy * 10);
+      ctx.lineTo(x + h.dx * 4 - h.dy * 5, y + h.dy * 4 + h.dx * 5);
+      ctx.moveTo(x + h.dx * 10, y + h.dy * 10);
+      ctx.lineTo(x + h.dx * 4 + h.dy * 5, y + h.dy * 4 - h.dx * 5);
+      ctx.stroke();
+    } else if (h.type === 'turret') {
+      ctx.fillStyle = 'rgba(80,80,80,0.3)';
+      ctx.beginPath();
+      ctx.ellipse(x, y + 10, 13, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#607d8b';
+      rr(ctx, x - 13, y - 12, 26, 24, 8);
+      ctx.fill();
+      ctx.strokeStyle = '#263238';
+      ctx.lineWidth = 2;
+      rr(ctx, x - 13, y - 12, 26, 24, 8);
+      ctx.stroke();
+      ctx.fillStyle = '#4fc3f7';
+      ctx.beginPath();
+      ctx.arc(x + h.dx * 7, y + h.dy * 7, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
 }
 
 // ---------- 보스전 ----------
@@ -818,8 +1493,26 @@ function drawBoss(s, a, b, t, now) {
   ctx.ellipse(x, y + R - 6, R * 0.85, 12, 0, 0, Math.PI * 2);
   ctx.fill();
 
+  // dash motion: lean into the run + dust kicked up behind
+  const dashVx = boss.dashing ? bb.x - ab.x : 0;
+  if (boss.dashing && Math.abs(dashVx) > 1 && Math.random() < 0.5) {
+    addParticle({
+      kind: 'dot',
+      x: x - Math.sign(dashVx) * 40,
+      y: y + 38,
+      vx: -Math.sign(dashVx) * (40 + Math.random() * 60),
+      vy: -20 - Math.random() * 40,
+      g: 200,
+      size: 3 + Math.random() * 3,
+      color: 'rgba(230,230,210,0.8)',
+      life: 0.4,
+      maxLife: 0.4,
+    });
+  }
+
   ctx.save();
   ctx.translate(x, y + bob);
+  if (boss.dashing) ctx.rotate(Math.sign(dashVx) * 0.12);
   ctx.scale(breathe, breathe);
 
   // tentacles
@@ -934,19 +1627,35 @@ function drawMinions(s, a, b, t, now) {
     const bm = (b.minions || []).find((q) => q.id === m.id);
     const am = prevById.get(m.id);
     const x = am && bm ? lerp(am.x, bm.x, t) : m.x;
-    const y = (am && bm ? lerp(am.y, bm.y, t) : m.y) + Math.sin(now / 180 + m.id) * 2;
+    const wob = m.frozen ? 0 : Math.sin(now / 180 + m.id) * 2;
+    const jit = m.berserk ? (Math.random() - 0.5) * 2.5 : 0;
+    const y = (am && bm ? lerp(am.y, bm.y, t) : m.y) + wob;
 
     ctx.fillStyle = 'rgba(0,0,0,0.22)';
     ctx.beginPath();
     ctx.ellipse(x, y + 11, 8, 3, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // spiky purple star creature
+    // flying (kicked) minion: speed afterimages
+    if (m.flying && am && bm) {
+      const vx = bm.x - am.x;
+      const vy = bm.y - am.y;
+      for (let g = 1; g <= 2; g++) {
+        ctx.globalAlpha = 0.18 / g;
+        ctx.fillStyle = '#81d4fa';
+        ctx.beginPath();
+        ctx.arc(x - vx * g * 0.5, y - vy * g * 0.5, 11, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // spiky star creature (purple / red when berserk / pale when frozen)
     ctx.save();
-    ctx.translate(x, y);
-    ctx.rotate(Math.sin(now / 260 + m.id) * 0.18);
-    ctx.fillStyle = '#ab47bc';
-    ctx.strokeStyle = 'rgba(60,10,80,0.55)';
+    ctx.translate(x + jit, y + jit);
+    ctx.rotate(m.flying ? now / 90 : Math.sin(now / 260 + m.id) * 0.18);
+    ctx.fillStyle = m.frozen ? '#b3e5fc' : m.berserk ? '#ef5350' : '#ab47bc';
+    ctx.strokeStyle = m.frozen ? 'rgba(2,119,189,0.6)' : 'rgba(60,10,80,0.55)';
     ctx.lineWidth = 1.8;
     ctx.beginPath();
     for (let i = 0; i < 10; i++) {
@@ -970,7 +1679,32 @@ function drawMinions(s, a, b, t, now) {
     ctx.arc(-3.5, -0.6, 1.3, 0, Math.PI * 2);
     ctx.arc(3.5, -0.6, 1.3, 0, Math.PI * 2);
     ctx.fill();
+
+    // ice shell while frozen
+    if (m.frozen) {
+      ctx.fillStyle = 'rgba(179,229,252,0.4)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.lineWidth = 2;
+      rr(ctx, -14, -14, 28, 28, 7);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.beginPath();
+      ctx.ellipse(-6, -7, 2.5, 4.5, -0.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.restore();
+
+    // hint above a frozen minion: push it!
+    if (m.frozen) {
+      ctx.font = 'bold 10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#e1f5fe';
+      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+      ctx.lineWidth = 3;
+      ctx.strokeText('밀어서 발사!', x, y - 20);
+      ctx.fillText('밀어서 발사!', x, y - 20);
+    }
   }
 }
 
@@ -1016,11 +1750,19 @@ function drawBanner(now) {
 }
 
 // ---------- 배경 (정적 레이어 프리렌더) ----------
+function themePalette(theme) {
+  if (theme === 'camp') return { a: '#b8d16d', b: '#a8c35d', hard: '#6d7f43', hardTop: '#8da15d', soft: '#d2a15c', softTop: '#e7c17a', vignette: 'rgba(80,54,16,0.2)' };
+  if (theme === 'sea' || theme === 'boss') return { a: '#87d5cf', b: '#78c7d8', hard: '#5b8fa8', hardTop: '#8fc7d8', soft: '#d9b26b', softTop: '#f0d08c', vignette: 'rgba(0,49,80,0.24)' };
+  if (theme === 'pangland') return { a: '#f7b7d1', b: '#f6c26b', hard: '#8e6bbd', hardTop: '#b993df', soft: '#e28b5b', softTop: '#ffc078', vignette: 'rgba(90,20,70,0.18)' };
+  return { a: '#b5e07e', b: '#a8d873', hard: '#8d6e63', hardTop: '#a1887f', soft: '#d9a05b', softTop: '#e8bd80', vignette: 'rgba(0,40,30,0.22)' };
+}
+
 function drawBackground(s) {
   const g = bgCanvas.getContext('2d');
+  const palette = themePalette(s.map && s.map.theme);
   for (let y = 0; y < ROWS; y++) {
     for (let x = 0; x < COLS; x++) {
-      g.fillStyle = (x + y) % 2 === 0 ? '#b5e07e' : '#a8d873';
+      g.fillStyle = (x + y) % 2 === 0 ? palette.a : palette.b;
       g.fillRect(x * TILE, y * TILE, TILE, TILE);
       if ((x * 7 + y * 13) % 11 === 0) {
         g.fillStyle = 'rgba(255,255,255,0.18)';
@@ -1033,26 +1775,45 @@ function drawBackground(s) {
   // hard blocks never change during a round
   for (let y = 0; y < ROWS; y++) {
     for (let x = 0; x < COLS; x++) {
-      if (s.grid[y][x] === 2) drawHardBlock(g, x, y);
+      if (s.grid[y][x] === 2) drawHardBlock(g, x, y, palette);
     }
   }
   const v = g.createRadialGradient(300, 260, 220, 300, 260, 420);
   v.addColorStop(0, 'rgba(0,0,0,0)');
-  v.addColorStop(1, 'rgba(0,40,30,0.22)');
+  v.addColorStop(1, palette.vignette);
   g.fillStyle = v;
   g.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
 }
 
-function drawHardBlock(g, x, y) {
+function softBlocksKey(s) {
+  const theme = (s.map && s.map.theme) || '';
+  return `${theme}|${s.grid.map((row) => row.join('')).join('/')}`;
+}
+
+function drawSoftBlocksLayer(s) {
+  const key = softBlocksKey(s);
+  if (key !== softLayerKey) {
+    softCtx.clearRect(0, 0, softCanvas.width, softCanvas.height);
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        if (s.grid[y][x] === 1) drawSoftBlock(softCtx, x, y, s.map && s.map.theme);
+      }
+    }
+    softLayerKey = key;
+  }
+  ctx.drawImage(softCanvas, 0, 0);
+}
+
+function drawHardBlock(g, x, y, palette) {
   const px = x * TILE;
   const py = y * TILE;
   g.fillStyle = 'rgba(0,0,0,0.22)';
   rr(g, px + 3, py + 5, TILE - 4, TILE - 6, 7);
   g.fill();
-  g.fillStyle = '#8d6e63';
+  g.fillStyle = palette.hard;
   rr(g, px + 2, py + 2, TILE - 4, TILE - 4, 7);
   g.fill();
-  g.fillStyle = '#a1887f';
+  g.fillStyle = palette.hardTop;
   rr(g, px + 2, py + 2, TILE - 4, TILE - 12, 7);
   g.fill();
   g.fillStyle = '#bcaaa4';
@@ -1064,30 +1825,31 @@ function drawHardBlock(g, x, y) {
   g.stroke();
 }
 
-function drawSoftBlock(x, y) {
+function drawSoftBlock(g, x, y, theme) {
+  const palette = themePalette(theme);
   const px = x * TILE;
   const py = y * TILE;
-  ctx.fillStyle = 'rgba(0,0,0,0.18)';
-  rr(ctx, px + 4, py + 6, TILE - 6, TILE - 8, 6);
-  ctx.fill();
-  ctx.fillStyle = '#d9a05b';
-  rr(ctx, px + 3, py + 3, TILE - 6, TILE - 6, 6);
-  ctx.fill();
-  ctx.fillStyle = '#e8bd80';
-  rr(ctx, px + 3, py + 3, TILE - 6, 12, 6);
-  ctx.fill();
-  ctx.strokeStyle = '#8d5a24';
-  ctx.lineWidth = 2;
-  rr(ctx, px + 3, py + 3, TILE - 6, TILE - 6, 6);
-  ctx.stroke();
-  ctx.strokeStyle = 'rgba(141,90,36,0.7)';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(px + 7, py + TILE / 2 + 1);
-  ctx.lineTo(px + TILE - 7, py + TILE / 2 + 1);
-  ctx.moveTo(px + TILE / 2, py + 7);
-  ctx.lineTo(px + TILE / 2, py + TILE - 7);
-  ctx.stroke();
+  g.fillStyle = 'rgba(0,0,0,0.18)';
+  rr(g, px + 4, py + 6, TILE - 6, TILE - 8, 6);
+  g.fill();
+  g.fillStyle = palette.soft;
+  rr(g, px + 3, py + 3, TILE - 6, TILE - 6, 6);
+  g.fill();
+  g.fillStyle = palette.softTop;
+  rr(g, px + 3, py + 3, TILE - 6, 12, 6);
+  g.fill();
+  g.strokeStyle = '#8d5a24';
+  g.lineWidth = 2;
+  rr(g, px + 3, py + 3, TILE - 6, TILE - 6, 6);
+  g.stroke();
+  g.strokeStyle = 'rgba(141,90,36,0.7)';
+  g.lineWidth = 1.5;
+  g.beginPath();
+  g.moveTo(px + 7, py + TILE / 2 + 1);
+  g.lineTo(px + TILE - 7, py + TILE / 2 + 1);
+  g.moveTo(px + TILE / 2, py + 7);
+  g.lineTo(px + TILE / 2, py + TILE - 7);
+  g.stroke();
 }
 
 // ---------- 아이템 ----------
@@ -1099,7 +1861,7 @@ function drawItems(s, now) {
     const bobP = (item.x * 31 + item.y * 17) % 7;
     const bob = Math.sin(now / 320 + bobP) * 2.5;
     const cy = item.y * TILE + TILE / 2 + bob;
-    if (item.type === 'ultra' || item.type === 'needle') {
+    if (item.type === 'ultra' || item.type === 'needle' || item.type === 'angel') {
       const pulse = 0.5 + 0.5 * Math.sin(now / 200 + bobP);
       ctx.fillStyle = `rgba(255, 235, 130, ${0.25 + pulse * 0.2})`;
       ctx.beginPath();
@@ -1110,15 +1872,37 @@ function drawItems(s, now) {
     ctx.beginPath();
     ctx.ellipse(cx, item.y * TILE + TILE - 6, 10, 3, 0, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,0.92)';
-    rr(ctx, cx - 14, cy - 14, 28, 28, 9);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
-    ctx.lineWidth = 1.5;
-    rr(ctx, cx - 14, cy - 14, 28, 28, 9);
-    ctx.stroke();
-    ctx.font = '19px serif';
-    ctx.fillText(ITEM_EMOJI[item.type] || '?', cx, cy + 1);
+    drawItemIcon(item.type, cx, cy, 28);
+  }
+}
+
+function drawItemIcon(type, cx, cy, size) {
+  const def = ITEM_DEFS[type] || ITEM_DEFS.bomb;
+  const r = size / 2;
+  const grad = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.45, 2, cx, cy, r + 4);
+  grad.addColorStop(0, '#ffffff');
+  grad.addColorStop(0.36, def.color);
+  grad.addColorStop(1, '#14335f');
+  ctx.fillStyle = grad;
+  rr(ctx, cx - r, cy - r, size, size, 9);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.32)';
+  ctx.lineWidth = 1.6;
+  rr(ctx, cx - r, cy - r, size, size, 9);
+  ctx.stroke();
+  const img = iconImage(def.icon);
+  if (img && img.complete && img.naturalWidth > 0) {
+    const pad = Math.max(3, Math.round(size * 0.12));
+    ctx.drawImage(img, cx - r + pad, cy - r + pad, size - pad * 2, size - pad * 2);
+  } else {
+    ctx.fillStyle = '#fff';
+    ctx.font = `900 ${type === 'ultra' ? 17 : 13}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+    ctx.lineWidth = 3;
+    ctx.strokeText(def.glyph, cx, cy + 1);
+    ctx.fillText(def.glyph, cx, cy + 1);
   }
 }
 
@@ -1171,8 +1955,8 @@ function drawStreams(s, now) {
   for (const w of s.streams) {
     const born = streamBorn.get(`${w.x},${w.y}`) || now;
     const age = (now - born) / 1000;
-    const grow = Math.min(1, age / 0.07);
-    const fade = w.left < 6 ? w.left / 6 : 1;
+    const grow = Math.max(0, Math.min(1, age / 0.07));
+    const fade = Math.max(0, Math.min(1, w.left / 6));
     const width = (15 + Math.sin(now / 55 + w.x + w.y) * 1.5) * grow * (0.55 + 0.45 * fade);
     const cx = w.x * TILE + TILE / 2;
     const cy = w.y * TILE + TILE / 2;
@@ -1182,7 +1966,7 @@ function drawStreams(s, now) {
     const S = set.has(`${w.x},${w.y + 1}`);
 
     for (const [color, k] of [['rgba(41,142,235,0.88)', 1], ['rgba(179,229,252,0.92)', 0.52]]) {
-      const wd = width * k;
+      const wd = Math.max(0, width * k);
       ctx.fillStyle = color;
       const x0 = W ? w.x * TILE : cx - wd;
       const x1 = E ? (w.x + 1) * TILE : cx + wd;
@@ -1276,6 +2060,22 @@ function drawCharacter(x, y, p, anim, now) {
   ctx.ellipse(x, y + 13, 11 / squash, 3.5, 0, 0, Math.PI * 2);
   ctx.fill();
 
+  if (p.shieldLeft > 0) {
+    const glow = 0.35 + 0.18 * Math.sin(now / 100);
+    ctx.strokeStyle = `rgba(129,255,170,${glow})`;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(x, by, 24, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (p.oxygenLeft > 0) {
+    ctx.fillStyle = 'rgba(77,208,225,0.78)';
+    ctx.beginPath();
+    ctx.arc(x + 15, by - 17, 5, 0, Math.PI * 2);
+    ctx.arc(x + 22, by - 22, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   ctx.save();
   ctx.translate(x, by);
   ctx.scale((1 / squash) * breathe, squash * breathe);
@@ -1305,15 +2105,12 @@ function drawCharacter(x, y, p, anim, now) {
     ctx.beginPath();
     ctx.arc(x, by, 24, -Math.PI / 2, -Math.PI / 2 + (p.trapLeft / TRAP_TICKS) * Math.PI * 2);
     ctx.stroke();
-    if (p.id === socket.id && p.needles > 0) {
-      ctx.font = 'bold 12px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillStyle = '#fff';
-      ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-      ctx.lineWidth = 3;
-      const hint = 'Ctrl/X 탈출!';
-      ctx.strokeText(hint, x, by - 34);
-      ctx.fillText(hint, x, by - 34);
+    if (p.id === socket.id && (p.needles > 0 || (p.inventory && p.inventory.oxygen > 0))) {
+      const rescueType = p.needles > 0 ? 'needle' : 'oxygen';
+      ctx.save();
+      ctx.globalAlpha = 0.94;
+      drawItemIcon(rescueType, x, by - 36, 23);
+      ctx.restore();
     }
   }
 
@@ -1521,6 +2318,10 @@ function lighten(hex, amt) {
 }
 
 function rr(g, x, y, w, h, r) {
+  if (w <= 0 || h <= 0) {
+    g.beginPath();
+    return;
+  }
   const rad = Math.min(r, w / 2, h / 2);
   g.beginPath();
   g.moveTo(x + rad, y);
@@ -1574,10 +2375,22 @@ function drawCountdown(s, now) {
 const cardEls = new Map(); // playerId -> {root, stats, status}
 let lastUiUpdate = 0;
 
+function itemSlotHtml(type, count, selected) {
+  const def = ITEM_DEFS[type];
+  const off = count ? '' : ' off';
+  const active = selected ? ' selected' : '';
+  return `<div class="bb-slot${off}${active}" style="--item:${def.color}"><img class="item-art" src="${assetUrl(def.icon)}" alt=""><span class="bb-name">${def.name}</span><span class="n">${count}</span></div>`;
+}
+
 function buildPlayerCards(roster) {
   const wrap = $('#player-cards');
   wrap.innerHTML = '';
   cardEls.clear();
+  const policyPanel = $('#agent-policy-panel');
+  if (policyPanel) {
+    policyPanel.hidden = !roster.some(isAgentPlayer);
+    policyPanel.open = false;
+  }
   roster.forEach((p, i) => {
     const card = document.createElement('div');
     card.className = 'p-card';
@@ -1597,7 +2410,11 @@ function buildPlayerCards(roster) {
     info.className = 'p-info';
     const name = document.createElement('div');
     name.className = 'p-name';
-    name.textContent = p.nick + (p.id === socket.id ? ' (나)' : '');
+    const nameText = document.createElement('span');
+    nameText.className = 'p-name-text';
+    nameText.textContent = p.nick + (p.id === socket.id ? ' (나)' : '');
+    name.appendChild(nameText);
+    appendAgentBadge(name, isAgentPlayer(p));
     const stats = document.createElement('div');
     stats.className = 'p-stats';
     stats.textContent = '🎈1 💧1 🛼0';
@@ -1610,8 +2427,9 @@ function buildPlayerCards(roster) {
     card.appendChild(cv);
     card.appendChild(info);
     card.appendChild(status);
+    card.classList.toggle('agent', isAgentPlayer(p));
     wrap.appendChild(card);
-    cardEls.set(p.id, { root: card, stats, status });
+    cardEls.set(p.id, { root: card, name, stats, status });
   });
 }
 
@@ -1629,16 +2447,26 @@ function renderUI(s, now) {
   for (const p of s.players) {
     const el = cardEls.get(p.id);
     if (!el) continue;
-    el.stats.textContent = `🎈${p.maxBombs} 💧${p.power} 🛼${p.speedLvl}${p.hasShoes ? ' 👟' : ''}`;
+    const shield = p.shieldLeft > 0 ? ' 방어' : '';
+    el.stats.textContent = `물풍선 ${p.maxBombs}/${p.maxBombCap} · 물줄기 ${p.power}/${p.maxPowerCap} · 속도 ${p.speedLvl}/${p.maxSpeedLvl}${p.hasShoes ? ' · 신발' : ''}${shield}`;
     el.root.classList.toggle('dead', !p.alive);
+    el.root.classList.toggle('agent', isAgentPlayer(p));
+    appendAgentBadge(el.name, isAgentPlayer(p));
     el.status.textContent = !p.alive ? '💀' : p.trapped ? '💧' : '';
   }
 
-  // sidebar ITEM box: usable item (needle)
   const me = s.players.find((p) => p.id === socket.id);
   const slot = $('#item-slot');
-  if (me && me.alive && me.needles > 0) {
-    slot.innerHTML = `🪡<span class="count">x${me.needles}</span>`;
+  if (me && me.alive) {
+    const trappedNeedle = me.trapped && me.needles > 0;
+    const selected = trappedNeedle ? 'needle' : me.selectedItem;
+    const def = ITEM_DEFS[selected] || ITEM_DEFS.needle;
+    const count = trappedNeedle ? me.needles : (me.inventory && me.inventory[selected]) || 0;
+    if (count > 0) {
+      slot.innerHTML = `<img class="item-art big" src="${assetUrl(def.icon)}" alt=""><span class="slot-name">${def.name}</span><span class="count">x${count}</span>`;
+    } else {
+      slot.innerHTML = '<span class="empty">없음</span>';
+    }
   } else {
     slot.innerHTML = '<span class="empty">없음</span>';
   }
@@ -1649,19 +2477,227 @@ function renderUI(s, now) {
     bb.innerHTML = '<div class="bb-slot off">관전 중</div>';
   } else {
     bb.innerHTML =
-      `<div class="bb-slot">🎈<span class="n">${me.maxBombs}</span></div>` +
-      `<div class="bb-slot">💧<span class="n">${me.power}</span></div>` +
-      `<div class="bb-slot">🛼<span class="n">${me.speedLvl}</span></div>` +
-      `<div class="bb-slot${me.needles ? '' : ' off'}">🪡<span class="n">${me.needles}</span></div>` +
-      `<div class="bb-slot${me.hasShoes ? '' : ' off'}">👟</div>`;
+      `<div class="bb-slot stat">물풍선<span class="n">${me.maxBombs}/${me.maxBombCap}</span></div>` +
+      `<div class="bb-slot stat">물줄기<span class="n">${me.power}/${me.maxPowerCap}</span></div>` +
+      `<div class="bb-slot stat">속도<span class="n">${me.speedLvl}/${me.maxSpeedLvl}</span></div>` +
+      `<div class="bb-slot${me.needles ? '' : ' off'} stat">바늘<span class="n">${me.needles}</span></div>` +
+      `<div class="bb-slot${me.hasShoes ? '' : ' off'} stat">신발</div>` +
+      ACTIVE_ITEMS.map((type) => itemSlotHtml(type, (me.inventory && me.inventory[type]) || 0, me.selectedItem === type)).join('');
   }
 }
 
 $('#btn-exit').addEventListener('click', () => {
   socket.emit('leaveRoom');
+  currentRoomId = null;
+  currentRoom = null;
+  agentPolicy.runtime = null;
+  resetAgentInvite();
   showScreen('lobby');
 });
 $('#btn-help').addEventListener('click', () => $('#guide').classList.toggle('hidden'));
 $('#btn-guide-close').addEventListener('click', () => $('#guide').classList.add('hidden'));
 
 requestAnimationFrame(frame);
+
+// ---------- 내 AI 참여 도움말 모달 ----------
+(function aiHelpModule() {
+  const modal = $('#ai-modal');
+  const openBtn = $('#btn-ai-help');
+  const closeBtn = $('#ai-modal-close');
+  const keyBody = $('#ai-key-body');
+  const cmdToken = $('#ai-cmd-token');
+  if (!modal || !openBtn || !keyBody) return;
+
+  const origin = window.location.origin;
+  let lastIssuedKey = '';
+
+  function tokenCommand() {
+    return `CRAZAY_ARKADE_AGENT_TOKEN=<초대-토큰> node examples/llm-reply-agent.js --url ${origin}`;
+  }
+  function keyCommand(key) {
+    return `CRAZAY_ARKADE_API_KEY=${key || '<발급한-키>'} node examples/heuristic-agent.js --url ${origin}`;
+  }
+
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        ta.remove();
+        if (!ok) throw new Error('copy rejected');
+      }
+      toast('복사했습니다.');
+    } catch {
+      toast('복사할 수 없습니다. 직접 선택해 복사하세요.');
+    }
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+  }
+
+  function renderLoggedOut(providers) {
+    const buttons = [];
+    if (providers.github) buttons.push(`<a class="ai-login-btn" href="/auth/github">GitHub로 로그인</a>`);
+    if (providers.google) buttons.push(`<a class="ai-login-btn" href="/auth/google">Google로 로그인</a>`);
+    if (!buttons.length) {
+      keyBody.innerHTML = `<p class="ai-note ai-warn">이 서버에는 OAuth 로그인이 설정되어 있지 않습니다. 운영자에게 설정을 요청하거나, 위의 '빠른 초대'를 사용하세요.</p>`;
+      return;
+    }
+    keyBody.innerHTML = `
+      <p class="ai-note">로그인하면 재사용 가능한 API 키를 발급할 수 있습니다. 로그인 후 이 창을 다시 열어주세요.</p>
+      <div class="ai-login-row">${buttons.join('')}</div>`;
+  }
+
+  function renderLoggedIn(keys) {
+    const items = (keys || []).map((k) => `
+      <div class="ai-key-item ${k.revoked ? 'revoked' : ''}">
+        <span class="ai-key-meta">
+          <b>${esc(k.label || 'agent key')}</b>
+          <span class="ai-key-prefix">${esc(k.keyPrefix || '')}…</span>
+          ${k.revoked ? '<span class="ai-key-revoked-tag">폐기됨</span>' : ''}
+        </span>
+        ${k.revoked ? '' : `<button class="agent-btn danger" type="button" data-revoke="${esc(k.id)}">폐기</button>`}
+      </div>`).join('');
+
+    const issuedBlock = lastIssuedKey ? `
+      <div class="ai-issued">
+        <b>새 키가 발급되었습니다.</b>
+        <span class="ai-issued-key">${esc(lastIssuedKey)}</span>
+        <p class="ai-note ai-warn">이 키는 지금만 표시됩니다. 안전한 곳에 복사해 두세요.</p>
+        <div class="ai-row">
+          <button class="agent-btn" type="button" data-copy-text="key">키 복사</button>
+          <button class="agent-btn" type="button" data-copy-text="keycmd">실행 명령 복사</button>
+        </div>
+        <code class="ai-cmd" style="margin-top:8px">${esc(keyCommand(lastIssuedKey))}</code>
+      </div>` : '';
+
+    keyBody.innerHTML = `
+      ${issuedBlock}
+      <div class="ai-row">
+        <button class="agent-btn" id="ai-issue-btn" type="button">새 API 키 발급</button>
+        <a class="agent-btn" href="#" id="ai-logout-btn">로그아웃</a>
+      </div>
+      <div class="ai-key-list">${items || '<p class="ai-note">아직 발급한 키가 없습니다.</p>'}</div>
+      <p class="ai-note">접속 명령: <code class="ai-cmd" style="display:inline-block;margin-top:4px">${esc(keyCommand(''))}</code></p>`;
+  }
+
+  async function loadKeySection() {
+    keyBody.innerHTML = `<p class="ai-note">불러오는 중…</p>`;
+    let config = { keyAuth: false, providers: {} };
+    try {
+      const r = await fetch('/account/config', { credentials: 'include' });
+      if (r.ok) config = await r.json();
+    } catch { /* 네트워크 오류 시 아래에서 안내 */ }
+
+    if (!config.keyAuth) {
+      keyBody.innerHTML = `<p class="ai-note ai-warn">이 서버는 API 키 인증이 비활성화되어 있습니다. 위의 '빠른 초대'를 사용하세요.</p>`;
+      return;
+    }
+    try {
+      const r = await fetch('/account/keys', { credentials: 'include' });
+      if (r.status === 401) {
+        renderLoggedOut(config.providers || {});
+        return;
+      }
+      if (r.ok) {
+        const data = await r.json();
+        renderLoggedIn(data.keys || []);
+        return;
+      }
+      keyBody.innerHTML = `<p class="ai-note ai-warn">키 정보를 불러오지 못했습니다 (HTTP ${r.status}).</p>`;
+    } catch {
+      keyBody.innerHTML = `<p class="ai-note ai-warn">서버에 연결할 수 없습니다.</p>`;
+    }
+  }
+
+  async function issueKey() {
+    try {
+      const r = await fetch('/account/keys', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: `web ${new Date().toISOString().slice(0, 10)}` }),
+      });
+      if (!r.ok) {
+        toast(r.status === 401 ? '로그인이 필요합니다.' : `발급 실패 (HTTP ${r.status})`);
+        return;
+      }
+      const data = await r.json();
+      lastIssuedKey = data.key || '';
+      await loadKeySection();
+    } catch {
+      toast('발급 중 오류가 발생했습니다.');
+    }
+  }
+
+  async function revokeKey(id) {
+    try {
+      const r = await fetch(`/account/keys/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+      if (!r.ok) {
+        toast(`폐기 실패 (HTTP ${r.status})`);
+        return;
+      }
+      toast('키를 폐기했습니다. 해당 키의 AI 연결은 즉시 끊깁니다.');
+      await loadKeySection();
+    } catch {
+      toast('폐기 중 오류가 발생했습니다.');
+    }
+  }
+
+  function openModal() {
+    if (cmdToken) cmdToken.textContent = tokenCommand();
+    lastIssuedKey = '';
+    modal.classList.remove('hidden');
+    loadKeySection();
+  }
+  function closeModal() {
+    lastIssuedKey = '';
+    modal.classList.add('hidden');
+  }
+
+  openBtn.addEventListener('click', openModal);
+  if (closeBtn) closeBtn.addEventListener('click', closeModal);
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
+  });
+
+  // 모달 내부 동작은 이벤트 위임으로 처리(재렌더에도 견고).
+  modal.addEventListener('click', (e) => {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    const copyId = t.getAttribute('data-copy');
+    if (copyId) {
+      const el = document.getElementById(copyId);
+      if (el) copyText(el.textContent || '');
+      return;
+    }
+    const copyText2 = t.getAttribute('data-copy-text');
+    if (copyText2 === 'key') { copyText(lastIssuedKey); return; }
+    if (copyText2 === 'keycmd') { copyText(keyCommand(lastIssuedKey)); return; }
+    if (t.id === 'ai-issue-btn') { issueKey(); return; }
+    if (t.id === 'ai-logout-btn') {
+      e.preventDefault();
+      fetch('/auth/logout', { method: 'POST', credentials: 'include' })
+        .catch(() => {})
+        .finally(() => { lastIssuedKey = ''; loadKeySection(); });
+      return;
+    }
+    const revokeId = t.getAttribute('data-revoke');
+    if (revokeId) revokeKey(revokeId);
+  });
+})();

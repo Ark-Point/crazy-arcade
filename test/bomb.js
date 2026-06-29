@@ -1,5 +1,3 @@
-// Regression: a placed balloon must be exit-only — after stepping off it,
-// walking back across it must be blocked (no traversal for anyone).
 const { io } = require('socket.io-client');
 
 const fail = (msg) => {
@@ -8,7 +6,8 @@ const fail = (msg) => {
 };
 setTimeout(() => fail('timed out'), 20000);
 
-const a = io('http://localhost:3000');
+const URL = process.env.URL || process.argv[2] || 'http://localhost:3000';
+const a = io(URL);
 let seq = 0;
 let phase = 'wait';
 let placedAt = 0;
@@ -46,7 +45,6 @@ a.on('state', (s) => {
     }, 450);
     setTimeout(() => {
       phase = 'done';
-      // bomb cell 0 spans x [0,40); blocked position is x = 40 + 13 = 53
       console.log(`x after walking back into own balloon: ${lastX}`);
       if (lastX < 52) fail(`traversed own balloon (x=${lastX}, expected >= 52)`);
       console.log('PASS');

@@ -2,7 +2,7 @@
 // assignment, game starts with teams, and team info flows through state.
 const { io } = require('socket.io-client');
 
-const URL = 'http://localhost:3000';
+const URL = process.env.URL || process.argv[2] || 'http://localhost:3000';
 const fail = (msg) => {
   console.error('FAIL:', msg);
   process.exit(1);

@@ -9,7 +9,8 @@ const fail = (msg) => {
 };
 setTimeout(() => fail('timed out (no bossWipe within 40s)'), 40000);
 
-const a = io('http://localhost:3000');
+const URL = process.env.URL || process.argv[2] || 'http://localhost:3000';
+const a = io(URL);
 
 let sawBoss = false;
 let sawTelegraph = false;

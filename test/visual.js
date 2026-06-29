@@ -2,6 +2,7 @@
 // game, hold a movement key, place a bomb, and screenshot the canvas.
 // Fails on any page JS error.
 const { chromium } = require('playwright');
+const URL = process.env.URL || process.argv[2] || 'http://localhost:3000';
 
 (async () => {
   const errors = [];
@@ -13,7 +14,7 @@ const { chromium } = require('playwright');
     page.on('console', (m) => {
       if (m.type() === 'error') errors.push(`${nick} console: ${m.text()}`);
     });
-    await page.goto('http://localhost:3000');
+    await page.goto(URL);
     await page.fill('#nick-input', nick);
     await page.click('#btn-enter');
     return page;
@@ -34,6 +35,10 @@ const { chromium } = require('playwright');
   await a.waitForFunction(() =>
     document.querySelector('.char-btn[data-char="2"]').classList.contains('selected')
   );
+  await a.waitForFunction(() => {
+    const text = document.querySelector('#player-list').textContent;
+    return text.includes('개구리') && text.includes('펭구');
+  });
   const slotText = await a.textContent('#player-list');
   if (!slotText.includes('개구리') || !slotText.includes('펭구')) {
     console.error('FAIL: character selection not reflected in player list:', slotText);

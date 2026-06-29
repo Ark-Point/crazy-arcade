@@ -11,8 +11,9 @@ setTimeout(() => fail('timed out'), 20000);
 const clients = [];
 let roomId = null;
 let joined = 0;
+const URL = process.env.URL || process.argv[2] || 'http://localhost:3000';
 
-const host = io('http://localhost:3000');
+const host = io(URL);
 clients.push(host);
 
 host.on('connect', () => {
@@ -23,7 +24,7 @@ host.on('connect', () => {
 host.on('joinedRoom', (room) => {
   roomId = room.id;
   for (let i = 2; i <= 8; i++) {
-    const c = io('http://localhost:3000');
+    const c = io(URL);
     clients.push(c);
     c.on('connect', () => {
       c.emit('setNick', 'P' + i);
