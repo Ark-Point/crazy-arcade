@@ -1,5 +1,6 @@
 // Boss mode E2E: two browsers start a boss room, fight a bit, screenshot.
 const { chromium } = require('playwright');
+const URL = process.env.URL || process.argv[2] || 'http://localhost:3000';
 
 (async () => {
   const errors = [];
@@ -11,9 +12,10 @@ const { chromium } = require('playwright');
     page.on('console', (m) => {
       if (m.type() === 'error') errors.push(`${nick} console: ${m.text()}`);
     });
-    await page.goto('http://localhost:3000');
+    await page.goto(URL);
     await page.fill('#nick-input', nick);
     await page.click('#btn-enter');
+    await page.waitForSelector('#screen-lobby.active');
     return page;
   }
 
@@ -23,6 +25,15 @@ const { chromium } = require('playwright');
   await a.click('#btn-create');
   await a.waitForSelector('#screen-room.active');
   await a.click('#btn-mode-boss');
+  await a.waitForFunction(() => document.querySelector('#btn-mode-boss').classList.contains('selected'));
+  await a.waitForFunction(() => {
+    const selected = document.querySelector('.map-btn.selected');
+    return selected && selected.dataset.map === 'boss-cove' && selected.textContent.includes('보스 해안');
+  });
+  await b.waitForFunction(() => {
+    const item = document.querySelector('.room-item');
+    return item && item.textContent.includes('보스') && item.textContent.includes('보스 해안');
+  });
   await b.waitForSelector('.room-item');
   await b.click('.room-item');
   await b.waitForSelector('#screen-room.active');

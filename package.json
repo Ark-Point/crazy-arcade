@@ -1,17 +1,31 @@
 {
-  "name": "crazy-arcade",
+  "name": "crazay-arkade",
   "version": "1.0.0",
-  "description": "Web-based multiplayer Crazy Arcade style game",
+  "description": "Web-based multiplayer Crazay Arkade style game",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node test/smoke.js"
+    "deploy:tunnel": "bash scripts/quick-tunnel.sh",
+    "test": "node test/smoke.js",
+    "test:agent": "node test/agent.js && node test/agent-policy-llm-reply.js",
+    "test:agent-heuristic": "node test/agent-heuristic.js && node test/agent-pacer.js && node test/agent-llm-reply-controller.js",
+    "test:agent-heuristic-live": "node test/agent-heuristic-live.js",
+    "test:agent-security": "node test/agent-security.js",
+    "test:agent-visual": "node test/agent-visual.js",
+    "test:perf-render": "node test/perf-render.js",
+    "test:agent-arena": "node --test test/agent-protocol.js test/agent-fairness.js test/agent-robustness.js test/agent-lifecycle.js test/agent-spectator-room.js",
+    "test:byo-arena": "node --test test/auth-store.js test/auth-store-redteam.js test/auth-session-oauth.js test/auth-session-oauth-redteam.js test/auth-keys-api.js test/auth-keys-api-redteam.js test/agent-auth.js test/agent-auth-redteam.js test/agent-matchmaking.js test/agent-matchmaking-redteam.js test/agent-conn-abuse.js test/agent-conn-abuse-redteam.js test/agent-resource-limits.js test/agent-resource-limits-redteam.js test/byo-integration.js",
+    "test:agent-advisory": "node test/advisory-scan.js",
+    "test:agent-native": "node --test test/agent-native-contract.js test/agent-native-reconnect-trace.js test/agent-native-benchmark.js",
+    "test:agent-all": "npm run test:agent && npm run test:agent-security && npm run test:agent-arena",
+    "test:regression": "node test/team.js && node test/team-solo.js && node test/eight.js && node test/bomb.js && node test/boss-unit.js && node test/origin-safe.js && node test/player-collision.js"
   },
   "dependencies": {
     "express": "^4.19.2",
     "socket.io": "^4.7.5"
   },
   "devDependencies": {
+    "playwright": "^1.61.0",
     "socket.io-client": "^4.7.5"
   }
 }

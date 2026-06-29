@@ -24,9 +24,6 @@
     return Math.max(0, ox) * Math.max(0, oy);
   }
 
-  // world: { solid(p, cx, cy) -> 0 open | 1 solid | 2 exit-only }
-  // exit-only cells (a balloon you are standing on) block any move that would
-  // increase your overlap with them: you can step off, never back in or across.
   function boxCollides(world, p, x, y) {
     const x0 = Math.floor((x - HALF) / TILE);
     const x1 = Math.floor((x + HALF - 1) / TILE);
