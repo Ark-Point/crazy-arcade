@@ -112,6 +112,7 @@ socket.on('roomUpdate', (room) => {
 
 let currentRoomId = null;
 let currentRoom = null;
+let chatMessages = [];
 const agentInvite = {
   token: '',
   pending: false,
@@ -125,6 +126,90 @@ const agentPolicy = {
   error: '',
   runtime: null,
 };
+
+function normalizeChatMessage(message) {
+  if (!message || typeof message !== 'object') return null;
+  if (typeof message.id !== 'string') return null;
+  if (message.scope !== 'room' && message.scope !== 'game') return null;
+  if (typeof message.text !== 'string' || typeof message.nick !== 'string') return null;
+  return message;
+}
+
+function renderChatFeed(feed, scope) {
+  if (!feed) return;
+  feed.replaceChildren();
+  const messages = chatMessages.filter((message) => message.scope === scope);
+  if (!messages.length) {
+    const empty = document.createElement('p');
+    empty.className = 'chat-empty';
+    empty.textContent = '아직 메시지가 없습니다.';
+    feed.appendChild(empty);
+    return;
+  }
+  for (const message of messages) {
+    const line = document.createElement('p');
+    line.className = 'chat-line';
+    if (message.senderId === socket.id) line.classList.add('mine');
+    const nick = document.createElement('b');
+    nick.textContent = message.nick;
+    const text = document.createElement('span');
+    text.textContent = message.text;
+    line.appendChild(nick);
+    line.append(' · ');
+    line.appendChild(text);
+    feed.appendChild(line);
+  }
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function renderChatFeeds() {
+  renderChatFeed($('#room-chat-feed'), 'room');
+  renderChatFeed($('#game-chat-feed'), 'game');
+}
+
+function syncChatHistory(history) {
+  if (!Array.isArray(history)) return;
+  const next = [];
+  for (const message of history) {
+    const normalized = normalizeChatMessage(message);
+    if (normalized) next.push(normalized);
+  }
+  chatMessages = next;
+  renderChatFeeds();
+}
+
+function appendChatMessage(message) {
+  const normalized = normalizeChatMessage(message);
+  if (!normalized || chatMessages.some((existing) => existing.id === normalized.id)) return;
+  chatMessages.push(normalized);
+  if (chatMessages.length > 50) chatMessages = chatMessages.slice(-50);
+  renderChatFeeds();
+}
+
+function sendChat(input, label) {
+  const sentValue = input.value;
+  const text = sentValue.trim();
+  if (!text) {
+    toast(`${label} 메시지를 입력하세요.`);
+    return;
+  }
+  const target = typeof socket.timeout === 'function' ? socket.timeout(3000) : socket;
+  target.emit('chatMessage', { text }, (err, ack) => {
+    if (err) {
+      toast('채팅을 보내지 못했습니다.');
+      return;
+    }
+    if (ack && ack.ok === false) {
+      toast(ack.error || '채팅을 보낼 수 없습니다.');
+      return;
+    }
+    if (input.value === sentValue) input.value = '';
+  });
+}
+
+function isTextEntryTarget(target) {
+  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target && target.isContentEditable);
+}
 
 function isAgentPlayer(player) {
   return player && player.controller === 'agent';
@@ -534,6 +619,8 @@ socket.on('agentInviteError', (payload) => {
 function renderRoom(room) {
   if (currentRoomId !== room.id) {
     currentRoomId = room.id;
+    chatMessages = [];
+    renderChatFeeds();
     agentPolicy.runtime = null;
     renderAgentPolicy();
     resetAgentInvite();
@@ -546,8 +633,6 @@ function renderRoom(room) {
     agentInvite.token = '';
   }
   $('#room-title').textContent = room.name;
-  const feedJoin = $('#room-feed-join');
-  if (feedJoin) feedJoin.textContent = `${room.name}에 참가하셨습니다.`;
   const isHost = room.host === socket.id;
   const teamMode = room.mode === 'team';
   const role = myRoomRole(room);
@@ -764,6 +849,17 @@ $('#btn-spectator-toggle').addEventListener('click', () => {
 $('#btn-agent-invite-create').addEventListener('click', createAgentInvite);
 $('#btn-agent-command-copy').addEventListener('click', copyAgentInviteCommand);
 $('#btn-agent-invite-revoke').addEventListener('click', revokeAgentInvite);
+$('#room-chat-send').addEventListener('click', () => sendChat($('#room-chat-input'), '대기실'));
+$('#room-chat-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendChat(e.currentTarget, '대기실');
+});
+$('#game-chat-send').addEventListener('click', () => sendChat($('#game-chat-input'), '인게임'));
+$('#game-chat-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendChat(e.currentTarget, '인게임');
+});
+
+socket.on('chatMessage', appendChatMessage);
+socket.on('chatHistory', syncChatHistory);
 
 // ---------- 게임: 넷코드 상태 ----------
 const canvas = $('#game-canvas');
@@ -807,6 +903,7 @@ socket.on('gameStart', ({ players }) => {
   agentPolicy.runtime = null;
   renderAgentPolicy();
   buildPlayerCards(players || []);
+  renderChatFeeds();
   snapshots = [];
   offsetSamples = [];
   pending = [];
@@ -1264,6 +1361,7 @@ const KEYMAP = {
 
 document.addEventListener('keydown', (e) => {
   if (!inGame()) return;
+  if (isTextEntryTarget(e.target)) return;
   if (e.code.startsWith('Digit')) {
     const n = Number(e.code.slice(5));
     const type = ACTIVE_ITEMS[n - 1];
@@ -1300,11 +1398,16 @@ document.addEventListener('keydown', (e) => {
 });
 
 document.addEventListener('keyup', (e) => {
+  if (isTextEntryTarget(e.target)) return;
   const dir = KEYMAP[e.code];
   if (dir) keys[dir] = false;
 });
 
 window.addEventListener('blur', () => {
+  keys.up = keys.down = keys.left = keys.right = false;
+});
+
+$('#game-chat-input').addEventListener('focus', () => {
   keys.up = keys.down = keys.left = keys.right = false;
 });
 

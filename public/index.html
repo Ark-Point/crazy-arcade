@@ -48,15 +48,13 @@
               <span class="active">전체 채팅</span>
               <span>길드 채팅</span>
             </div>
-            <div class="room-feed" aria-live="polite">
-              <p><b>반곰슬</b> · 미션2-18//고립/댁ㄴ/오래함@@</p>
-              <p id="room-feed-join">대기실에 참가하셨습니다.</p>
-              <p>부정한 방법으로 타인의 주민등록번호를 이용하실 경우 불이익을 받을 수 있습니다.</p>
+            <div id="room-chat-feed" class="room-feed" aria-live="polite">
+              <p class="chat-empty">아직 메시지가 없습니다.</p>
             </div>
             <div class="room-chat-input">
               <span>&lt;모두에게&gt;</span>
-              <input type="text" aria-label="채팅 입력" autocomplete="off" />
-              <button type="button" aria-label="채팅 보내기">전송</button>
+              <input id="room-chat-input" type="text" maxlength="100" aria-label="대기실 채팅 입력" autocomplete="off" />
+              <button id="room-chat-send" type="button" aria-label="대기실 채팅 보내기">전송</button>
             </div>
           </div>
         </section>
@@ -170,6 +168,16 @@
           <div class="item-box-label">ITEM</div>
           <div id="item-slot" class="item-slot"></div>
         </div>
+        <section class="game-chat" aria-label="인게임 채팅">
+          <div class="game-chat-head">채팅</div>
+          <div id="game-chat-feed" class="game-chat-feed" aria-live="polite">
+            <p class="chat-empty">아직 메시지가 없습니다.</p>
+          </div>
+          <div class="game-chat-input">
+            <input id="game-chat-input" type="text" maxlength="100" aria-label="인게임 채팅 입력" autocomplete="off" />
+            <button id="game-chat-send" type="button" aria-label="인게임 채팅 보내기">전송</button>
+          </div>
+        </section>
         <button id="btn-help" class="btn-side">게임 방법</button>
         <button id="btn-exit" class="btn-side danger">나가기</button>
       </aside>

@@ -70,6 +70,8 @@ function doCreateRoom(ctx, identity, opts = {}) {
     players: new Map([[identity.id, playerFromIdentity(identity, 'red')]]),
     spectators: new Map(),
     game: null,
+    chat: [],
+    chatSeq: 0,
   };
   ctx.rooms.set(room.id, room);
   return { room };

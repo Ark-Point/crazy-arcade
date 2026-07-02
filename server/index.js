@@ -33,6 +33,9 @@ const BYO_GLOBAL_MAX_AGENT_CONNS = Number(process.env.BYO_GLOBAL_MAX_AGENT_CONNS
 const BYO_LOBBY_MSG_PER_SEC_CAP = Math.max(30, Number(process.env.BYO_LOBBY_MSG_PER_SEC_CAP) || 30);
 // 메인 io 방 생성/시작 최소 throttle(게임 입력 미적용).
 const BYO_MAIN_IO_CREATE_PER_SEC = Number(process.env.BYO_MAIN_IO_CREATE_PER_SEC) || 2;
+const CHAT_MAX_CHARS = 100;
+const CHAT_HISTORY_LIMIT = 50;
+const CHAT_MESSAGES_PER_SEC = 5;
 
 // G007(S7) 자원/동시성 상한(env, 미설정 시 운영 기본). 휴먼 비회귀를 위해 기본값은 넉넉히 둔다.
 // finiteOr: 0 을 포함한 유효 숫자는 보존하고, 미설정/비숫자만 기본값으로(0 묵살 footgun 방지).
@@ -88,6 +91,7 @@ const msgThrottle = createMsgThrottle({ perSecCap: BYO_LOBBY_MSG_PER_SEC_CAP });
 // 메인 io createRoom/startGame 은 각각 독립 슬라이딩 윈도우로 둔다(서로 슬롯을 잠식하지 않게).
 const mainCreateThrottle = createMsgThrottle({ perSecCap: BYO_MAIN_IO_CREATE_PER_SEC });
 const mainStartThrottle = createMsgThrottle({ perSecCap: BYO_MAIN_IO_CREATE_PER_SEC });
+const mainChatThrottle = createMsgThrottle({ perSecCap: CHAT_MESSAGES_PER_SEC });
 
 // G007(S7) 자원/동시성 상한 인스턴스. rooms 의 'playing' 방 수를 전역/예약/키별로 게이트한다.
 // isAgentRoom/keyIdsForRoom 은 room.players + agentRecords 로 방의 성격/키 소속을 해석한다.
@@ -1216,6 +1220,59 @@ function leaveRoom(socket) {
   if (res.room) reviewRoomLifecycle(res.room);
 }
 
+function normalizeChatText(payload) {
+  const raw = payload && typeof payload === 'object' ? payload.text : payload;
+  if (typeof raw !== 'string') return '';
+  return raw.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, CHAT_MAX_CHARS);
+}
+
+function roomMember(room, socket) {
+  return room.players.get(socket.id) || (room.spectators && room.spectators.get(socket.id)) || null;
+}
+
+function appendChatMessage(room, socket, text) {
+  if (!Array.isArray(room.chat)) room.chat = [];
+  if (!Number.isSafeInteger(room.chatSeq)) room.chatSeq = 0;
+  room.chatSeq += 1;
+  const member = roomMember(room, socket);
+  const message = {
+    id: `${Date.now().toString(36)}-${room.chatSeq}`,
+    scope: room.state === 'playing' ? 'game' : 'room',
+    senderId: socket.id,
+    nick: (member && member.nick) || socket.data.nick || '플레이어',
+    text,
+    sentAt: Date.now(),
+  };
+  room.chat.push(message);
+  if (room.chat.length > CHAT_HISTORY_LIMIT) room.chat.splice(0, room.chat.length - CHAT_HISTORY_LIMIT);
+  return message;
+}
+
+function sendChatHistory(socket, room) {
+  socket.emit('chatHistory', Array.isArray(room.chat) ? room.chat.slice(-CHAT_HISTORY_LIMIT) : []);
+}
+
+function handleChatMessage(socket, payload, ack) {
+  const reply = (response) => { if (typeof ack === 'function') ack(response); };
+  const room = rooms.get(socket.data.roomId);
+  if (!room || !roomMember(room, socket)) {
+    reply({ ok: false, error: 'not in room' });
+    return;
+  }
+  if (!mainChatThrottle.allow(socket)) {
+    reply({ ok: false, error: 'rate limited' });
+    return;
+  }
+  const text = normalizeChatText(payload);
+  if (!text) {
+    reply({ ok: false, error: 'empty message' });
+    return;
+  }
+  const message = appendChatMessage(room, socket, text);
+  io.to(room.id).emit('chatMessage', message);
+  reply({ ok: true, message });
+}
+
 function startGame(room) {
   if (room.players.size === 0) return { ok: false, error: '게임을 시작하려면 플레이어가 필요합니다.' };
   // G007(S7) 공유 게이트: 방이 에이전트 포함이면 전역+키별 상한, 휴먼 전용이면 소프트 플로어를
@@ -1663,6 +1720,7 @@ io.on('connection', (socket) => {
     socket.join(room.id);
     socket.data.roomId = room.id;
     socket.emit('joinedRoom', roomDetail(room));
+    sendChatHistory(socket, room);
     broadcastRooms();
   });
 
@@ -1679,6 +1737,7 @@ io.on('connection', (socket) => {
     socket.join(room.id);
     socket.data.roomId = room.id;
     socket.emit('joinedRoom', roomDetail(room));
+    sendChatHistory(socket, room);
     io.to(room.id).emit('roomUpdate', roomDetail(room));
     broadcastRooms();
     reviewRoomLifecycle(room);
@@ -1744,6 +1803,10 @@ io.on('connection', (socket) => {
     broadcastRooms();
     reviewRoomLifecycle(room);
     reply({ ok: true, room: roomDetail(room) });
+  });
+
+  socket.on('chatMessage', (payload, ack) => {
+    handleChatMessage(socket, payload, ack);
   });
 
   socket.on('createAgentInvite', (options, ack) => {
