@@ -274,7 +274,6 @@ function renderAgentPolicy() {
   const budget = $('#agent-policy-budget');
   const externalRuntime = window.agentPolicy && window.agentPolicy.schema ? window.agentPolicy : null;
   const runtime = externalRuntime || agentPolicy.runtime;
-  if (runtime) panel.open = true;
   const cards = runtime && Array.isArray(runtime.cards) && runtime.cards.length ? runtime.cards : agentPolicy.cards;
   summary.textContent = agentPolicy.error
     || (runtime ? `${runtime.nick || 'AI'}가 게임 중 생성` : agentPolicy.overview)

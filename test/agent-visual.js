@@ -93,6 +93,46 @@ const assertNoOverflow = async (browser, page, selectors) => {
   await assert(browser, failures.length === 0, `obvious AI UI overflow:\n${failures.join('\n')}`);
 };
 
+const gameLayoutMetrics = async (page) => page.evaluate(() => {
+  const rectOf = (selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    return {
+      top: Math.round(rect.top),
+      left: Math.round(rect.left),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+  };
+  const policyPanel = document.querySelector('#agent-policy-panel');
+  return {
+    canvas: rectOf('#game-canvas'),
+    sidebar: rectOf('.sidebar'),
+    itemBox: rectOf('.item-box'),
+    helpButton: rectOf('#btn-help'),
+    policy: rectOf('#agent-policy-panel'),
+    policyOpen: !!(policyPanel && policyPanel.open),
+  };
+});
+
+const assertStablePolicyUpdateLayout = async (browser, before, after) => {
+  await assert(browser, before.policyOpen === false, 'policy drawer should start collapsed in-game');
+  await assert(browser, after.policyOpen === false, 'runtime policy update opened the drawer without user action');
+  for (const key of ['canvas', 'sidebar', 'itemBox', 'helpButton']) {
+    const oldRect = before[key];
+    const newRect = after[key];
+    await assert(browser, oldRect && newRect, `${key} layout metrics were unavailable`);
+    const drift = Math.max(
+      Math.abs(oldRect.top - newRect.top),
+      Math.abs(oldRect.left - newRect.left),
+      Math.abs(oldRect.width - newRect.width),
+      Math.abs(oldRect.height - newRect.height)
+    );
+    await assert(browser, drift <= 2, `${key} drifted by ${drift}px after runtime policy update`);
+  }
+};
+
 const emitRuntimePolicy = (agent) => new Promise((resolve, reject) => {
   agent.timeout(2000).emit('agentPolicyUpdate', {
     schema: 'crazay-arkade-agent-runtime-policy.v1',
@@ -213,12 +253,15 @@ const emitRuntimePolicy = (agent) => new Promise((resolve, reject) => {
     await page.click('#btn-start');
     await page.waitForSelector('#screen-game.active', { timeout: 8000 });
     await page.waitForSelector(`${SELECTORS.policyPanel}:visible`, { timeout: 8000 });
+    const beforePolicyUpdateLayout = await gameLayoutMetrics(page);
     await emitRuntimePolicy(agent);
-    await page.click(`${SELECTORS.policyPanel} summary`);
     await page.waitForFunction(() => {
       const panel = document.querySelector('#agent-policy-panel');
       return panel && panel.textContent.includes('테스트 런타임 카드');
     }, { timeout: 3000 });
+    const afterPolicyUpdateLayout = await gameLayoutMetrics(page);
+    await assertStablePolicyUpdateLayout(browser, beforePolicyUpdateLayout, afterPolicyUpdateLayout);
+    await page.click(`${SELECTORS.policyPanel} summary`);
     const policyText = (await page.textContent(SELECTORS.policyPanel)).trim();
     await assert(browser, policyText.includes('게임 중 생성'), 'policy UI did not label runtime generated policy');
     await assert(browser, policyText.includes('LLM reply'), 'policy UI did not show LLM reply decision mode');
