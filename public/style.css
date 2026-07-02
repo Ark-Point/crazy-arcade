@@ -1272,7 +1272,7 @@ button:focus-visible {
 
 .in-game-policy .agent-policy-list {
   grid-template-columns: 1fr;
-  max-height: 280px;
+  max-height: 190px;
   margin-top: 8px;
   min-width: 0;
 }
