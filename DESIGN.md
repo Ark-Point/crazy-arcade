@@ -132,6 +132,7 @@ Spacing follows a 4px base unit, with existing compact deviations documented rat
 - **Variants**: hidden when no AI is in the match, collapsed summary, expanded policy list.
 - **Spacing**: 8px padding, 6px list gaps, 190px max expanded list height.
 - **Depth**: dark compact sidebar panel; quieter than player cards and item panels.
+- **Live feedback**: `.agent-policy-live` sits above policy cards and shows the latest AI action, decision tick, and short intent as a compact realtime feed.
 
 ### Invite Strip
 - **Structure**: one compact unframed control group in the room panel, using token text, status text, copy, command-copy, create, revoke buttons, a monospace command preview, and a short ordered help block.

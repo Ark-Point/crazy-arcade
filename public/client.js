@@ -103,6 +103,8 @@ socket.on('roomUpdate', (room) => {
   renderRoom(room);
   if (room.state === 'waiting') {
     agentPolicy.runtime = null;
+    agentPolicy.liveEvents = [];
+    agentPolicy.liveEventKey = '';
     renderAgentPolicy();
   }
   if (room.state === 'waiting' && screens.game.classList.contains('active')) {
@@ -124,6 +126,8 @@ const agentPolicy = {
   loaded: false,
   error: '',
   runtime: null,
+  liveEvents: [],
+  liveEventKey: '',
 };
 
 function isAgentPlayer(player) {
@@ -171,6 +175,113 @@ function runtimePolicyBudget(runtime) {
   if (runtime.decisionTick !== null && runtime.decisionTick !== undefined) parts.push(`판단 틱 ${runtime.decisionTick}`);
   if (runtime.generatedAtTick !== null && runtime.generatedAtTick !== undefined) parts.push(`관측 틱 ${runtime.generatedAtTick}`);
   return parts.join(' · ');
+}
+
+function directionLabel(direction) {
+  if (direction === 'up') return '위';
+  if (direction === 'down') return '아래';
+  if (direction === 'left') return '왼쪽';
+  if (direction === 'right') return '오른쪽';
+  return '';
+}
+
+function directionFromKeys(keys) {
+  if (!keys || typeof keys !== 'object') return '';
+  if (keys.up) return 'up';
+  if (keys.down) return 'down';
+  if (keys.left) return 'left';
+  if (keys.right) return 'right';
+  return '';
+}
+
+function liveActionLabel(action) {
+  if (!action || typeof action !== 'object') return '대기';
+  if (typeof action.label === 'string' && action.label.trim()) return action.label.trim().slice(0, 48);
+  const dir = directionLabel(action.direction || directionFromKeys(action.keys));
+  if (action.type === 'placeBomb') return '물풍선 설치';
+  if (action.type === 'move') return dir ? `${dir} 이동` : '이동';
+  if (action.type === 'wait') return '대기';
+  if (action.type === 'useNeedle') return '바늘 사용';
+  if (action.type === 'useItem') return action.item ? `${action.item} 사용` : '아이템 사용';
+  if (action.type === 'selectItem') return action.item ? `${action.item} 선택` : '아이템 선택';
+  return String(action.type || '행동').slice(0, 48);
+}
+
+function policyLiveKey(policy) {
+  const action = policy && policy.lastAction;
+  return [
+    policy && policy.playerId,
+    policy && policy.revision,
+    policy && policy.decisionTick,
+    action && action.seq,
+    action && action.type,
+  ].join(':');
+}
+
+function recordAgentLiveEvent(policy) {
+  if (!policy || !policy.lastAction) return;
+  const key = policyLiveKey(policy);
+  if (key === agentPolicy.liveEventKey) return;
+  agentPolicy.liveEventKey = key;
+  agentPolicy.liveEvents.unshift({
+    key,
+    nick: policy.nick || 'AI',
+    tick: policy.decisionTick,
+    heuristic: policy.selectedHeuristicId || '',
+    intent: policy.intent || policy.overview || '',
+    action: policy.lastAction,
+  });
+  agentPolicy.liveEvents = agentPolicy.liveEvents.slice(0, 3);
+}
+
+function renderAgentLive(runtime) {
+  const live = $('#agent-policy-live');
+  if (!live) return;
+  live.replaceChildren();
+  const events = agentPolicy.liveEvents.length ? agentPolicy.liveEvents : [];
+  const latestAction = runtime && runtime.lastAction;
+  if (!events.length && !latestAction) {
+    const empty = document.createElement('div');
+    empty.className = 'agent-policy-live-empty';
+    empty.textContent = 'AI 실시간 대기';
+    live.appendChild(empty);
+    return;
+  }
+  const head = document.createElement('div');
+  head.className = 'agent-policy-live-head';
+  const title = document.createElement('b');
+  title.textContent = 'AI 실시간';
+  const latest = events[0] || {
+    nick: runtime.nick || 'AI',
+    tick: runtime.decisionTick,
+    heuristic: runtime.selectedHeuristicId || '',
+    intent: runtime.intent || runtime.overview || '',
+    action: latestAction,
+  };
+  const tick = document.createElement('span');
+  tick.textContent = latest.tick === null || latest.tick === undefined ? '틱 대기' : `틱 ${latest.tick}`;
+  head.append(title, tick);
+  live.appendChild(head);
+
+  const list = document.createElement('div');
+  list.className = 'agent-policy-live-list';
+  const feed = events.length ? events : [latest];
+  for (const event of feed) {
+    const row = document.createElement('div');
+    row.className = 'agent-policy-live-row';
+    const action = document.createElement('span');
+    action.className = 'agent-policy-live-action';
+    action.textContent = `마지막 행동 ${liveActionLabel(event.action)}`;
+    const meta = document.createElement('span');
+    meta.className = 'agent-policy-live-meta';
+    const metaParts = [];
+    if (event.heuristic) metaParts.push(event.heuristic);
+    if (event.intent) metaParts.push(event.intent);
+    meta.textContent = metaParts.join(' · ') || event.nick;
+    row.append(action, meta);
+    list.appendChild(row);
+  }
+  live.appendChild(list);
 }
 
 function renderPolicyChips(parent, runtime) {
@@ -281,6 +392,7 @@ function renderAgentPolicy() {
     || '기준 정책 불러오는 중';
   budget.textContent = runtime ? runtimePolicyBudget(runtime) : (agentPolicy.actionBudgetNote || '액션 예산 확인 중');
   list.replaceChildren();
+  renderAgentLive(runtime);
 
   if (agentPolicy.error) {
     const empty = document.createElement('div');
@@ -342,6 +454,7 @@ socket.on('agentPolicyUpdate', (policy) => {
   if (!policy || !Array.isArray(policy.cards) || !policy.cards.length) return;
   if (policy.roomId && currentRoomId && policy.roomId !== currentRoomId) return;
   agentPolicy.runtime = policy;
+  recordAgentLiveEvent(policy);
   renderAgentPolicy();
 });
 
@@ -535,6 +648,8 @@ function renderRoom(room) {
   if (currentRoomId !== room.id) {
     currentRoomId = room.id;
     agentPolicy.runtime = null;
+    agentPolicy.liveEvents = [];
+    agentPolicy.liveEventKey = '';
     renderAgentPolicy();
     resetAgentInvite();
   }

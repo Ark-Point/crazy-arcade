@@ -169,7 +169,7 @@ const waitForChildExit = () => new Promise((resolve, reject) => {
       if (Array.isArray(state.bombs) && state.bombs.length > 0) sawBomb = true;
     });
     host.on('agentPolicyUpdate', (policy) => {
-      if (!policy || policy.schema !== 'crazay-arkade-agent-runtime-policy.v1') return;
+      if (!policy || !['crazay-arkade-agent-runtime-policy.v1', 'crazay-arkade-agent-runtime-policy.v2'].includes(policy.schema)) return;
       if (policy.decisionSource !== 'llm-reply') return;
       if (!Array.isArray(policy.cards)) return;
       const generated = policy.cards.find((card) => card && card.kind === 'create' && /^(runtime|llm-reply)-/.test(card.id || ''));

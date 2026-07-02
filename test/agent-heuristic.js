@@ -1,4 +1,5 @@
 'use strict';
+// noqa: SIZE_OK - Single-file regression harness keeps heuristic behavior fixtures together to avoid cross-file fixture drift.
 
 const assert = require('assert');
 const {
@@ -14,6 +15,8 @@ const {
   createMovementSequencer,
   planMovementSequence,
 } = require('../lib/agent/heuristics');
+const { createActionPacer } = require('../lib/agent/action-pacer');
+const { localHeuristicId } = require('../examples/llm-reply-agent');
 
 function emptyGrid() {
   return Array.from({ length: constants.ROWS }, () => Array(constants.COLS).fill(constants.TILE_EMPTY));
@@ -27,6 +30,7 @@ function selfAt(x, y, extras = {}) {
     alive: true,
     trapped: false,
     power: 2,
+    activeBombs: 0,
     maxBombs: 1,
     needles: 1,
     inventory: { shield: 0, oxygen: 0, glove: 0, trap: 0 },
@@ -121,14 +125,63 @@ assert.deepStrictEqual(chooseAction({ state: {} }), { type: 'wait' }, 'missing s
   const obs = observationAt(3, 3, {
     state: {
       grid,
+      players: [
+        selfAt(3, 3),
+        selfAt(7, 3, { id: 'opponent-1', needles: 0 }),
+      ],
+    },
+  });
+  assert.strictEqual(
+    localHeuristicId(obs),
+    'safe-bomb-farm',
+    'local LLM reply should choose safe bomb farming before generic opponent pressure when a bomb is safe and useful'
+  );
+}
+
+{
+  const obs = observationAt(3, 3, {
+    state: {
+      items: [{ x: 4, y: 3, type: 'needle' }],
+      players: [
+        selfAt(3, 3),
+        selfAt(5, 3, { id: 'opponent-1', needles: 0 }),
+      ],
+    },
+  });
+  const action = chooseAction(obs, {});
+  assert.strictEqual(action.type, 'placeBomb', `fallback bot should bomb a safe same-lane opponent before collecting, got ${JSON.stringify(action)}`);
+  assert.strictEqual(localHeuristicId(obs), 'pressure-trap', 'local LLM reply should choose pressure-trap for a safe immediate opponent blast');
+  const bot = createHeuristicAgent();
+  const pressureAction = bot.chooseActionForHeuristic(obs, 'pressure-trap');
+  assert.strictEqual(pressureAction.type, 'placeBomb', `pressure-trap should execute a safe pressure bomb, got ${JSON.stringify(pressureAction)}`);
+  const policy = bot.policySnapshot();
+  assert(policy.cards.some((card) => card.id === 'runtime-pressure-bomb'), 'pressure-trap should publish a pressure-bomb runtime card');
+}
+
+{
+  const grid = addSoft(emptyGrid(), [[5, 3]]);
+  const obs = observationAt(3, 3, {
+    state: {
+      grid,
       bombs: [{ id: 99, x: 10, y: 10, t: 60, power: 1, pass: [] }],
     },
   });
   const details = canSafelyPlaceBomb(obs, { details: true });
-  assert.strictEqual(details.ok, false, 'maxBombs=1 should conservatively reject bombing while a bomb is active');
-  assert.strictEqual(details.reason, 'capacity', 'active bomb rejection should explain capacity');
+  assert.strictEqual(details.ok, true, 'remote bombs should not consume self bomb capacity when self.activeBombs is available');
   const action = chooseAction(obs, {});
-  assert.notStrictEqual(action.type, 'placeBomb', 'agent should not place a second bomb while at conservative capacity');
+  assert.strictEqual(action.type, 'placeBomb', `agent should still farm with a safe self bomb while remote bombs exist, got ${JSON.stringify(action)}`);
+  assert.strictEqual(localHeuristicId(obs), 'safe-bomb-farm', 'local LLM reply should keep safe farm available under distant bomb pressure');
+}
+
+{
+  const grid = addSoft(emptyGrid(), [[5, 3]]);
+  const obs = observationAt(3, 3, {
+    self: { activeBombs: 1 },
+    state: { grid },
+  });
+  const details = canSafelyPlaceBomb(obs, { details: true });
+  assert.strictEqual(details.ok, false, 'self activeBombs at maxBombs should reject another bomb');
+  assert.strictEqual(details.reason, 'capacity', 'self active bomb rejection should explain capacity');
 }
 
 {
@@ -139,6 +192,20 @@ assert.deepStrictEqual(chooseAction({ state: {} }), { type: 'wait' }, 'missing s
   });
   const action = chooseAction(obs, {});
   assert(isMove(action, 'right'), `safe adjacent item should move right, got ${JSON.stringify(action)}`);
+}
+
+{
+  const obs = observationAt(1, 1, {
+    state: {
+      bombs: [{ id: 'far-bomb', x: 10, y: 10, t: 60, power: 1, pass: [] }],
+      items: [{ x: 2, y: 1, type: 'needle' }],
+    },
+  });
+  assert.strictEqual(
+    localHeuristicId(obs),
+    'item-value',
+    'local LLM reply should not survival-veto a distant harmless bomb when a safe adjacent item exists'
+  );
 }
 
 {
@@ -262,6 +329,65 @@ assert.deepStrictEqual(chooseAction({ state: {} }), { type: 'wait' }, 'missing s
 
 {
   const bot = createHeuristicAgent();
+  const first = bot.chooseAction(observationAt(1, 1, {
+    state: {
+      players: [
+        selfAt(1, 1),
+        selfAt(5, 1, { id: 'opponent-1', needles: 0 }),
+      ],
+    },
+  }));
+  assert(isMove(first, 'right'), `pressure approach should start by moving right, got ${JSON.stringify(first)}`);
+  const second = bot.chooseAction(observationAt(3, 1, {
+    state: {
+      tick: 121,
+      players: [
+        selfAt(3, 1),
+        selfAt(5, 1, { id: 'opponent-1', needles: 0 }),
+      ],
+    },
+  }));
+  assert.strictEqual(
+    second.type,
+    'placeBomb',
+    `fallback pressure route should convert to a bomb once the opponent enters blast range, got ${JSON.stringify(second)}`
+  );
+}
+
+{
+  const fresh = createHeuristicAgent();
+  const aligned = observationAt(4, 1, {
+    state: {
+      tick: 121,
+      players: [
+        selfAt(4, 1),
+        selfAt(5, 1, { id: 'opponent-1', needles: 0 }),
+      ],
+    },
+  });
+  const freshAction = fresh.chooseActionForHeuristic(aligned, 'route-commit');
+  assert.notStrictEqual(freshAction.type, 'placeBomb', 'fresh route-commit should not invent a bomb without pressure-route intent');
+
+  const bot = createHeuristicAgent();
+  const first = bot.chooseAction(observationAt(1, 1, {
+    state: {
+      players: [
+        selfAt(1, 1),
+        selfAt(5, 1, { id: 'opponent-1', needles: 0 }),
+      ],
+    },
+  }));
+  assert(isMove(first, 'right'), `pressure setup should start by moving right, got ${JSON.stringify(first)}`);
+  const second = bot.chooseActionForHeuristic(aligned, 'route-commit');
+  assert.strictEqual(
+    second.type,
+    'placeBomb',
+    `pressure pending-bomb state should override route-commit at the staged blast cell, got ${JSON.stringify(second)}`
+  );
+}
+
+{
+  const bot = createHeuristicAgent();
   const first = bot.nextAction(observationAt(1, 1));
   const second = bot.nextAction(observationAt(1, 1));
   assert.strictEqual(first.seq, 1, 'first bot action seq should be 1');
@@ -275,11 +401,17 @@ assert.deepStrictEqual(chooseAction({ state: {} }), { type: 'wait' }, 'missing s
       items: [{ x: 2, y: 1, type: 'needle' }],
     },
   });
-  bot.nextAction(obs);
+  const pacer = createActionPacer({ decisionTicks: 1 });
+  const desired = bot.chooseAction(obs);
+  const action = pacer.nextAction(obs, { ...desired, seq: 41 });
+  bot.recordAction(action);
   const policy = bot.policySnapshot();
   assert.strictEqual(policy.schema, 'crazay-arkade-agent-runtime-policy.v1', 'bot should expose runtime policy schema');
   assert(policy.cards.some((card) => card.id === 'runtime-item-route'), 'bot should generate an item-route heuristic card');
   assert(policy.cards.some((card) => card.kind === 'enforce'), 'bot should include runtime enforcement cards');
+  assert(policy.lastAction, 'bot runtime policy should expose the latest executable action');
+  assert.strictEqual(policy.lastAction.seq, 41, 'bot runtime policy action snapshot should match emitted seq');
+  assert.strictEqual(policy.lastAction.type, action.type, 'bot runtime policy action snapshot should match emitted action type');
 }
 
 console.log('PASS agent heuristic unit tests');

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 'use strict';
+// noqa: SIZE_OK - Standalone CLI example keeps arg parsing, socket lifecycle, and local reply provider in one runnable entrypoint.
 
 const { io } = require('socket.io-client');
-const { chooseAction, canSafelyPlaceBomb } = require('../lib/agent/heuristics');
+const { chooseAction, chooseActionForHeuristic, canSafelyPlaceBomb, buildDangerMap, constants, cellKey, playerCell } = require('../lib/agent/heuristics');
 const { createActionPacer } = require('../lib/agent/action-pacer');
 const { createLlmReplyController } = require('../lib/agent/llm-reply-controller');
 
@@ -122,14 +123,28 @@ function localHeuristicId(observation) {
   const self = observation && observation.self ? observation.self : {};
   const state = observation && observation.state ? observation.state : {};
   if (self.trapped || status.reason === 'trapped_agent_can_use_escape_action') return 'survival-veto';
-  if ((Array.isArray(state.streams) && state.streams.length > 0) || (Array.isArray(state.bombs) && state.bombs.length > 0)) return 'survival-veto';
-  if (Array.isArray(state.items) && state.items.length > 0) return 'item-value';
-  if (Array.isArray(state.players) && state.players.some((player) => player && player.id !== self.id && player.alive !== false && player.trapped !== true)) return 'pressure-trap';
+  if (hasUrgentSelfDanger(observation)) return 'survival-veto';
+  if (Array.isArray(state.players) && state.players.some((player) => player && player.id !== self.id && player.alive !== false && player.trapped !== true)) {
+    const action = chooseActionForHeuristic(observation, {}, 'pressure-trap');
+    if (action.type === 'placeBomb') return 'pressure-trap';
+  }
   if (canSafelyPlaceBomb(observation)) {
     const action = chooseAction(observation, {});
     if (action.type === 'placeBomb') return 'safe-bomb-farm';
   }
+  if (Array.isArray(state.items) && state.items.length > 0) return 'item-value';
+  if (Array.isArray(state.players) && state.players.some((player) => player && player.id !== self.id && player.alive !== false && player.trapped !== true)) return 'pressure-trap';
   return 'fallback-move';
+}
+
+function hasUrgentSelfDanger(observation) {
+  if (!observation || !observation.self || !observation.state) return false;
+  const selfCell = playerCell(observation.self, observation.state);
+  if (!selfCell) return false;
+  const danger = buildDangerMap(observation);
+  const key = cellKey(selfCell.x, selfCell.y);
+  const dangerAt = danger.dangerAt.get(key);
+  return danger.lethalNow.has(key) || (Number.isFinite(dangerAt) && dangerAt <= constants.ESCAPE_URGENCY_TICKS);
 }
 
 function actionSchemaPrompt(observation) {
@@ -282,7 +297,14 @@ async function main() {
   });
 }
 
-main().catch((err) => {
-  console.error(`[llm-reply-agent] ${err.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`[llm-reply-agent] ${err.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  localHeuristicId,
+  localReplyProvider,
+};

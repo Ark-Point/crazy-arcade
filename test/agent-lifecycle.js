@@ -119,17 +119,34 @@ test('B10: human+agent FFA ends deterministically when the agent disconnects', a
   await waitForEvent(host, 'state', (s) => s && s.countdown === 0, 'B10 active match', COUNTDOWN_MS);
 
   // 에이전트 소켓 close → removeAgent → checkEnd → 남은 사람 호스트가 승자.
+  const benchmarkSummary = waitForEvent(
+    host,
+    'agentBenchmarkSummary',
+    (summary) => summary
+      && summary.schema === 'crazay-arkade-agent-benchmark.v1'
+      && summary.tracks
+      && summary.tracks.outcome
+      && summary.tracks.outcome.matches >= 1
+      && summary.tracks.outcome.losses >= 1
+      && summary.tracks.outcome.deathReasons.elimination >= 1,
+    'B10 agent benchmark gameOver summary',
+    GAMEOVER_MS
+  );
   agent.disconnect();
 
-  const over = await waitForEvent(
+  const [over, benchmark] = await Promise.all([waitForEvent(
     host,
     'gameOver',
     (o) => o && o.winner && o.winnerTeam === null,
     'B10 deterministic gameOver',
     GAMEOVER_MS
-  );
+  ), benchmarkSummary]);
   assert(over.winner && over.winner.id, 'B10: gameOver winner must carry an id');
   assert(over.winnerTeam === null, 'B10: FFA gameOver winnerTeam must be null');
+  assert(
+    benchmark.tracks.outcome.survivalTickSamples === benchmark.tracks.outcome.matches,
+    'B10: benchmark should record survival ticks for each agent result'
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -165,6 +182,8 @@ test('A2: baseline bot takes over a stalled agent and auto-advances its seq', as
     (policy) => policy
       && policy.source === 'fallbackBot'
       && policy.playerId === pid
+      && policy.lastAction
+      && typeof policy.lastAction.type === 'string'
       && Array.isArray(policy.cards)
       && policy.cards.some((card) => card.kind === 'create'),
     'A2 fallback bot runtime policy update',
@@ -189,6 +208,7 @@ test('A2: baseline bot takes over a stalled agent and auto-advances its seq', as
     `baseline bot takeover unimplemented: seq stayed at ${baseSeq} with no input (no autonomous progress)`
   );
   assert(policy.cards.some((card) => card.kind === 'enforce'), 'fallback bot runtime policy should include an enforcement card');
+  assert(policy.lastAction && policy.lastAction.type, 'fallback bot runtime policy should expose the latest executable action');
 });
 
 // A3: 게임 중 원에이전트 재접속 → 봇에서 슬롯 제어 회수.
