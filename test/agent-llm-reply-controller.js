@@ -83,6 +83,9 @@ async function flush() {
   assert.strictEqual(decisions[0].policy.llmReplyId, 'reply-unit-1', 'policy should preserve reply id');
   assert.strictEqual(decisions[0].policy.selectedHeuristicId, 'fallback-move', 'policy should preserve selected heuristic');
   assert.strictEqual(decisions[0].policy.decisionTick, 104, 'decision tick should use freshest observation at reply time');
+  assert(decisions[0].policy.lastAction, 'policy should expose the executable action for live AI feedback');
+  assert.strictEqual(decisions[0].policy.lastAction.seq, decisions[0].action.seq, 'policy action snapshot should match emitted action seq');
+  assert.strictEqual(decisions[0].policy.lastAction.type, decisions[0].action.type, 'policy action snapshot should match emitted action type');
   assert(resolvers.length >= 2, 'controller should request the next reply after resolving one');
   controller.close();
 
@@ -133,6 +136,7 @@ async function flush() {
   assert.strictEqual(sequenceDecisions[1].policy.llmReplyId, 'sequence-reply', 'between-reply sequence action should use the active reply');
   assert(sequenceDecisions[1].policy.sequencePlan, 'between-reply sequence action should expose the active sequence plan');
   assert.strictEqual(sequenceDecisions[1].policy.sequencePlan.kind, 'safe-fallback', 'fallback sequence should publish baseline plan kind');
+  assert(sequenceDecisions[1].policy.lastAction, 'between-reply sequence policy should expose the executable action');
   sequenceController.close();
 
   console.log('PASS agent LLM reply controller tests');

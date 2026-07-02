@@ -15,6 +15,7 @@ const SELECTORS = {
   policyPanel: '#agent-policy-panel',
   policyCard: '.agent-policy-card',
   policyBudget: '#agent-policy-budget',
+  policyLive: '#agent-policy-live',
 };
 
 const fail = async (browser, msg) => {
@@ -95,14 +96,24 @@ const assertNoOverflow = async (browser, page, selectors) => {
 
 const emitRuntimePolicy = (agent) => new Promise((resolve, reject) => {
   agent.timeout(2000).emit('agentPolicyUpdate', {
-    schema: 'crazay-arkade-agent-runtime-policy.v1',
+    schema: 'crazay-arkade-agent-runtime-policy.v2',
     revision: 7,
     decisionSource: 'llm-reply',
     llmReplyId: 'reply-visual-001',
     selectedHeuristicId: 'item-value',
     decisionTick: 123,
     generatedAtTick: 123,
+    phase: 'farm',
+    intent: 'safe_bomb_then_escape',
+    risk: 'low',
+    confidence: 0.82,
     overview: '테스트 에이전트가 게임 중 생성한 정책',
+    lastAction: {
+      seq: 42,
+      type: 'placeBomb',
+      label: '물풍선 설치',
+      direction: 'down',
+    },
     cards: [
       {
         id: 'runtime-visual-route',
@@ -214,16 +225,27 @@ const emitRuntimePolicy = (agent) => new Promise((resolve, reject) => {
     await page.waitForSelector('#screen-game.active', { timeout: 8000 });
     await page.waitForSelector(`${SELECTORS.policyPanel}:visible`, { timeout: 8000 });
     await emitRuntimePolicy(agent);
-    await page.click(`${SELECTORS.policyPanel} summary`);
     await page.waitForFunction(() => {
       const panel = document.querySelector('#agent-policy-panel');
-      return panel && panel.textContent.includes('테스트 런타임 카드');
+      const live = document.querySelector('#agent-policy-live');
+      return panel
+        && panel.open
+        && live
+        && live.offsetParent !== null
+        && live.textContent.includes('물풍선 설치')
+        && panel.textContent.includes('테스트 런타임 카드');
     }, { timeout: 3000 });
-    const policyText = (await page.textContent(SELECTORS.policyPanel)).trim();
+    const policyText = (await page.locator(`${SELECTORS.policyPanel}[open]`).innerText()).trim();
     await assert(browser, policyText.includes('게임 중 생성'), 'policy UI did not label runtime generated policy');
     await assert(browser, policyText.includes('LLM reply'), 'policy UI did not show LLM reply decision mode');
     await assert(browser, policyText.includes('휴리스틱 item-value'), 'policy UI did not show selected heuristic');
     await assert(browser, policyText.includes('판단 틱 123'), 'policy UI did not show LLM reply decision tick');
+    await page.waitForSelector(`${SELECTORS.policyLive}:visible`, { timeout: 3000 });
+    const liveText = (await page.locator(`${SELECTORS.policyLive}:visible`).innerText()).trim();
+    await assert(browser, liveText.includes('AI 실시간'), 'policy UI did not expose a live AI feedback feed');
+    await assert(browser, liveText.includes('마지막 행동'), 'live AI feedback did not label the latest action');
+    await assert(browser, liveText.includes('물풍선 설치'), 'live AI feedback did not show the latest executable action');
+    await assert(browser, liveText.includes('틱 123'), 'live AI feedback did not show the live decision tick');
     await assert(browser, policyText.includes('테스트 런타임 카드'), 'policy UI did not show runtime generated policy in game');
     await assert(browser, policyText.includes('테스트 안전 집행'), 'policy UI did not show runtime enforcement policy in game');
     const budgetText = (await page.textContent(SELECTORS.policyBudget)).trim();

@@ -12,6 +12,7 @@ const {
   AGENT_ACTION_BUDGET_NOTE,
   HEURISTIC_POLICY_CARDS,
 } = require('../lib/agent/heuristics');
+const { createBenchmarkTracker } = require('../lib/agent/benchmark');
 const { createStore, hashKey } = require('./auth/store');
 const { resolveSessionSecret, requireSession } = require('./auth/session');
 const { createOAuthRouter, buildDefaultProviders } = require('./auth/oauth');
@@ -218,7 +219,41 @@ function roomDetail(room) {
       char: s.char,
       controller: 'human',
     })),
+    agentBenchmark: room.agentBenchmarkSummary || null,
   };
+}
+
+function resultForBenchmarkParticipant(gameOver, participant) {
+  const reason = gameOver && gameOver.reason ? gameOver.reason : null;
+  if (reason === 'bossDown') return 'win';
+  if (reason === 'bossWipe') return 'loss';
+  if (!gameOver || (!gameOver.winner && !gameOver.winnerTeam)) return 'tie';
+  if (gameOver.winner && gameOver.winner.id === participant.id) return 'win';
+  if (gameOver.winnerTeam !== null && gameOver.winnerTeam !== undefined && gameOver.winnerTeam === participant.team) return 'win';
+  return 'loss';
+}
+
+function recordAgentBenchmarkGameOver(room, gameOver) {
+  if (!room || !room.agentBenchmark) return null;
+  const participants = Array.isArray(room.agentBenchmarkPlayers) ? room.agentBenchmarkPlayers : [];
+  if (!participants.length) return null;
+  const survivalTicks = room.game && Number.isFinite(room.game.tick) ? room.game.tick : undefined;
+  const reason = gameOver && gameOver.reason
+    ? String(gameOver.reason)
+    : ((gameOver && (gameOver.winner || gameOver.winnerTeam)) ? 'elimination' : 'draw');
+  for (const participant of participants) {
+    const result = resultForBenchmarkParticipant(gameOver, participant);
+    room.agentBenchmark.record({
+      type: 'match.finished',
+      result,
+      survivalTicks,
+      reason,
+      deathReason: result === 'loss' ? reason : undefined,
+    });
+  }
+  room.agentBenchmarkSummary = room.agentBenchmark.summary();
+  io.to(room.id).emit('agentBenchmarkSummary', room.agentBenchmarkSummary);
+  return room.agentBenchmarkSummary;
 }
 
 function roomTick(room) {
@@ -826,6 +861,20 @@ function cleanSequencePlan(value) {
   return cleaned.kind || cleaned.objective || cleaned.target ? cleaned : null;
 }
 
+function cleanAgentActionSnapshot(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const cleaned = {
+    type: cleanPolicyText(value.type, '', 32),
+    seq: Number.isSafeInteger(value.seq) ? value.seq : null,
+    label: cleanPolicyText(value.label, '', 48),
+    direction: cleanPolicyText(value.direction, '', 16),
+    item: cleanPolicyText(value.item, '', 32),
+    keys: cleanPolicyObject(value.keys, 4),
+  };
+  if (!cleaned.type) return null;
+  return cleaned;
+}
+
 function policyPayloadIsTooLarge(payload) {
   try {
     return Buffer.byteLength(JSON.stringify(payload), 'utf8') > AGENT_POLICY_UPDATE_MAX_BYTES;
@@ -921,6 +970,7 @@ function sanitizeAgentPolicyUpdate(payload, record, roomId, source) {
     reason: payload.schema === AGENT_POLICY_SCHEMA_V2 ? cleanPolicyText(payload.reason, '', 160) : '',
     sequencePlan: payload.schema === AGENT_POLICY_SCHEMA_V2 ? cleanSequencePlan(payload.sequencePlan) : null,
     actionMask: payload.schema === AGENT_POLICY_SCHEMA_V2 ? cleanPolicyObject(payload.actionMask, 10) : null,
+    lastAction: cleanAgentActionSnapshot(payload.lastAction),
     benchmark: payload.schema === AGENT_POLICY_SCHEMA_V2 ? cleanPolicyObject(payload.benchmark, 10) : null,
     overview: cleanPolicyText(payload.overview, '에이전트가 게임 중 휴리스틱을 생성했습니다.', 180),
     cards: cleanedCards,
@@ -1025,6 +1075,7 @@ function driveStalledAgents(room, state) {
     };
     const desiredAction = record.bot.chooseAction(observation);
     const action = record.botPacer.nextAction(observation, desiredAction);
+    if (action && typeof record.bot.recordAction === 'function') record.bot.recordAction(action);
     const policy = typeof record.bot.policySnapshot === 'function' ? record.bot.policySnapshot() : null;
     if (policy && policy.revision !== record.botPolicyRevision && Array.isArray(policy.cards) && policy.cards.length) {
       record.botPolicyRevision = policy.revision;
@@ -1231,11 +1282,17 @@ function startGame(room) {
     char: p.char || 0,
     controller: p.controller || 'human',
   }));
+  room.agentBenchmarkPlayers = players
+    .filter((p) => p.controller === 'agent')
+    .map((p) => ({ id: p.id, nick: p.nick, team: p.team, char: p.char }));
+  room.agentBenchmark = room.agentBenchmarkPlayers.length ? createBenchmarkTracker() : null;
+  room.agentBenchmarkSummary = room.agentBenchmark ? room.agentBenchmark.summary() : null;
   const mapId = room.mode === 'boss' ? 'boss-cove' : room.mapId;
   room.game = new Game(
     players,
     (event, data) => {
       io.to(room.id).emit(event, data);
+      if (event === 'gameOver') recordAgentBenchmarkGameOver(room, data);
       if (event === 'state') {
         emitAgentObservations(room, data);
         driveStalledAgents(room, data);
